@@ -291,6 +291,11 @@ all = [
 [dependency-groups]
 build = ["setuptools", "torch<=2.10.0", "Cython", "packaging"]
 dev = ["jupyter"]
+eai-warcs = [
+    "boto3>=1.41.5",
+    "pandas>=2.3.3",
+    "warcio>=1.7.5",
+]
 linting = ["pre-commit", "ruff==0.14.10"]
 test = [
     "coverage",

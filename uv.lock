@@ -5438,6 +5438,11 @@ build = [
 dev = [
     { name = "jupyter" },
 ]
+eai-warcs = [
+    { name = "boto3" },
+    { name = "pandas" },
+    { name = "warcio" },
+]
 linting = [
     { name = "pre-commit" },
     { name = "ruff" },
@@ -5625,6 +5630,11 @@ build = [
     { name = "torch", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "<=2.10.0", index = "https://download.pytorch.org/whl/cu129" },
 ]
 dev = [{ name = "jupyter" }]
+eai-warcs = [
+    { name = "boto3", specifier = ">=1.41.5" },
+    { name = "pandas", specifier = ">=2.3.3" },
+    { name = "warcio", specifier = ">=1.7.5" },
+]
 linting = [
     { name = "pre-commit" },
     { name = "ruff", specifier = "==0.14.10" },
