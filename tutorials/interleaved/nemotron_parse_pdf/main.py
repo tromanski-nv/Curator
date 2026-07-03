@@ -67,11 +67,14 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import time
 from dataclasses import dataclass
+from typing import Any
 
+import pandas as pd
 from loguru import logger
 
 from nemo_curator.backends.xenna import XennaExecutor
@@ -120,6 +123,113 @@ class PerfLoggingStage(ProcessingStage[FileGroupTask, FileGroupTask]):
         return task
 
 
+def _pipeline_sample_id(manifest_file_name: str) -> str:
+    """Derive the ``sample_id`` the pipeline assigns for a manifest entry.
+
+    Matches ``PDFPreprocessStage``: ``file_name.rsplit(".", 1)[0]``. For
+    JSONL manifests built with ``generate_jsonl_manifest.py --file-name-field sha-1``,
+    ``file_name`` holds the content hash (not the human-readable repo path), and
+    that hash becomes ``sample_id`` in the output parquet.
+    """
+    return manifest_file_name.rsplit(".", 1)[0]
+
+
+def _manifest_entry_done(record: dict[str, Any], file_name_field: str, done_sample_ids: set[str]) -> bool:
+    """Return True when this manifest line was already written to output parquet."""
+    if file_name_field not in record:
+        return False
+    return _pipeline_sample_id(str(record[file_name_field])) in done_sample_ids
+
+
+def collect_completed_sample_ids(output_dir: str) -> set[str]:
+    """Return ``sample_id`` values already present in output parquet files.
+
+    Each fully completed task writes one parquet. ``sample_id`` is whatever
+    identifier the preprocess stage derived from the manifest ``file_name``
+    field (PDF stem for ``--pdf-dir`` runs, or e.g. a SHA-1 hash for JSONL
+    manifests). Used by :func:`prepare_resumable_manifest`.
+    """
+    done: set[str] = set()
+    pattern = os.path.join(output_dir, "*.parquet")
+    for path in glob.glob(pattern):
+        basename = os.path.basename(path)
+        if basename.startswith("_perf_stats"):
+            continue
+        try:
+            df = pd.read_parquet(path, columns=["sample_id"])
+            done.update(df["sample_id"].astype(str).unique())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Skipping {path} during resume scan: {exc}")
+    return done
+
+
+def prepare_resumable_manifest(
+    manifest_path: str,
+    output_dir: str,
+    *,
+    file_name_field: str,
+    file_names_field: str,
+) -> tuple[str, int, int]:
+    """Filter *manifest_path* to PDFs not yet present in *output_dir*.
+
+    Matching compares manifest ``file_name`` (via :func:`_pipeline_sample_id`) to
+    output ``sample_id``. For ``generate_jsonl_manifest.py --file-name-field sha-1``,
+    both sides are the PDF content hash even though the source JSONL also has a
+    separate human-readable ``file_name`` path field.
+
+    Writes ``<output_dir>/_manifest_remaining.jsonl`` when filtering is needed
+    so repeated Slurm allocations can reuse the same ``--output-dir``.
+
+    Returns
+    -------
+    manifest_to_use, n_pdfs_in_original, n_pdfs_remaining
+    """
+    done = collect_completed_sample_ids(output_dir)
+    if not done:
+        with open(manifest_path) as f:
+            n_total = sum(1 for line in f if line.strip())
+        return manifest_path, n_total, n_total
+
+    remaining_path = os.path.join(output_dir, "_manifest_remaining.jsonl")
+    n_total = 0
+    n_remaining = 0
+
+    with open(manifest_path) as src, open(remaining_path, "w") as dst:
+        for raw_line in src:
+            line = raw_line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+
+            if file_names_field in record:
+                file_names = record[file_names_field]
+                pending = [f for f in file_names if _pipeline_sample_id(f) not in done]
+                n_total += len(file_names)
+                if not pending:
+                    continue
+                n_remaining += len(pending)
+                if len(pending) == len(file_names):
+                    dst.write(raw_line if raw_line.endswith("\n") else raw_line + "\n")
+                else:
+                    dst.write(json.dumps({**record, file_names_field: pending}) + "\n")
+            elif file_name_field in record:
+                n_total += 1
+                if _manifest_entry_done(record, file_name_field, done):
+                    continue
+                n_remaining += 1
+                dst.write(raw_line if raw_line.endswith("\n") else raw_line + "\n")
+            else:
+                dst.write(raw_line if raw_line.endswith("\n") else raw_line + "\n")
+                n_total += 1
+                n_remaining += 1
+
+    logger.info(
+        f"Resume: {len(done)} PDFs already in {output_dir}; "
+        f"{n_remaining}/{n_total} PDFs remaining -> {remaining_path}"
+    )
+    return remaining_path, n_total, n_remaining
+
+
 def create_nemotron_parse_pdf_argparser() -> argparse.ArgumentParser:
     """Create the argument parser for the Nemotron-Parse PDF pipeline."""
     parser = argparse.ArgumentParser(description="Process PDFs through Nemotron-Parse into interleaved parquet")
@@ -134,6 +244,13 @@ def create_nemotron_parse_pdf_argparser() -> argparse.ArgumentParser:
     # Output
     parser.add_argument("--output-dir", required=True, help="Output directory for parquet files")
     parser.add_argument("--dataset-name", default="pdf_dataset", help="Dataset name for output tasks")
+    parser.add_argument(
+        "--checkpoint-path",
+        default=None,
+        help="Directory for resumability checkpoints (LMDB). When set, source partitions that "
+        "already completed in a previous run are skipped on rerun; failed ones rerun. Requires "
+        "the pipeline resumability feature (upstream PR #2063).",
+    )
 
     # Model
     parser.add_argument(
@@ -180,6 +297,14 @@ def create_nemotron_parse_pdf_argparser() -> argparse.ArgumentParser:
         "--file-names-field", default="cc_pdf_file_names", help="JSONL field for list of PDF filenames"
     )
     parser.add_argument("--url-field", default="url", help="JSONL field for source URL")
+
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip PDFs whose sample_id already appears in --output-dir parquet files. "
+        "Re-run with the same --output-dir after a Slurm time limit to resume. This is a "
+        "tutorial-level resume (scans output parquets); it is independent of --checkpoint-path.",
+    )
 
     return parser
 
@@ -276,6 +401,18 @@ def main() -> None:
     args.output_dir = os.path.abspath(args.output_dir)
     os.makedirs(args.output_dir, exist_ok=True)
 
+    if args.skip_existing:
+        manifest_to_use, n_total, n_remaining = prepare_resumable_manifest(
+            args.manifest,
+            args.output_dir,
+            file_name_field=args.file_name_field,
+            file_names_field=args.file_names_field,
+        )
+        args.manifest = manifest_to_use
+        if n_remaining == 0:
+            logger.info(f"All {n_total} PDFs already processed in {args.output_dir}; nothing to do.")
+            return
+
     if os.environ.get("SLURM_JOB_ID"):
         from nemo_curator.core.client import SlurmRayClient
 
@@ -297,8 +434,14 @@ def main() -> None:
             }
         )
 
+        # Only pass checkpoint_path when the user opts in, so this script still runs
+        # on Curator versions that predate the resumability feature (PR #2063).
+        run_kwargs: dict = {"executor": executor}
+        if args.checkpoint_path:
+            run_kwargs["checkpoint_path"] = args.checkpoint_path
+
         t0 = time.perf_counter()
-        results = pipeline.run(executor=executor)
+        results = pipeline.run(**run_kwargs)
         wall_time = time.perf_counter() - t0
 
         n_valid = sum(1 for r in results if r is not None)
