@@ -299,16 +299,17 @@ for MANIFEST in "\${MANIFESTS[@]}"; do
     set -euo pipefail
     cd '${CURATOR_DIR}' && source .venv/bin/activate
 
-    # Clean slate before this manifest brings up its own Ray/vLLM cluster. A
-    # prior manifest that was SIGTERM'd can orphan vLLM EngineCore processes that
-    # keep the torch.distributed rendezvous port (e.g. 20703) bound, so the next
-    # manifest dies with 'EADDRINUSE: address already in use' and the failure
-    # cascades down the chain. Stop leftover Ray, reap orphaned engine/worker
-    # procs on this (exclusive) node, then let the listen sockets drain. These
-    # patterns never match this launcher's own command line.
+    # Clean slate before this manifest starts its own Ray/vLLM cluster: reap any
+    # leftover engine/actor procs a prior (SIGTERM'd) manifest orphaned so their
+    # torch.distributed listen port is free and the next cluster can bind it.
+    # CRITICAL: this whole heredoc is the launcher's own argv, so a plain
+    # 'pkill -f <word>' would match (and SIGKILL) this very shell if <word> also
+    # appears here. The bracket-glob patterns below (first char in [ ]) match the
+    # real target processes but NOT the literal pattern text in this argv, so the
+    # launcher never kills itself.
     ray stop --force >/dev/null 2>&1 || true
-    pkill -9 -f EngineCore >/dev/null 2>&1 || true
-    pkill -9 -f 'ray::' >/dev/null 2>&1 || true
+    pkill -9 -f '[E]ngineCore' >/dev/null 2>&1 || true
+    pkill -9 -f '[r]ay::' >/dev/null 2>&1 || true
     sleep 15
 
     # Re-apply the vLLM Nemotron-Parse shard-id fix in case the venv was
