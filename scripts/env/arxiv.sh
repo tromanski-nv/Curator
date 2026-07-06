@@ -16,6 +16,7 @@ export MANIFEST_DIR=$WORK/manifests
 export OUTPUT=$WORK/out
 export ACCOUNT=nemotron_n4_pre
 export PARTITION=batch
+export JOB_PREFIX=sdg_nparse_arxiv   # distinct per dataset so scancel/squeue can target one chain
 
 # Scale / tuning — Option A: 16 nodes, ~2 days for 2,904,491 PDFs @ 6.77 s/PDF
 export NODES=16

@@ -16,6 +16,7 @@ set -gx MANIFEST_DIR $WORK/manifests
 set -gx OUTPUT       $WORK/out
 set -gx ACCOUNT      nemotron_n4_pre
 set -gx PARTITION    batch
+set -gx JOB_PREFIX   sdg_nparse_pubmed   # distinct per dataset so scancel/squeue can target one chain
 
 # Scale / tuning — CALIBRATED for 2,121,576 PDFs @ ~4.16 s/PDF (measured 2026-07-02)
 set -gx NODES         16
