@@ -69,6 +69,72 @@ if [[ ! -d "${MANIFEST_DIR}" ]]; then
   exit 1
 fi
 
+# ---- Pre-flight: self-heal repo + venv before queueing any jobs --------------
+# The custom scripts/main.py live only on a feature branch and have twice been
+# lost to filesystem purges. Before submitting, guarantee a known-good state so a
+# chain can never silently run against missing or wrong code again:
+#   1. enforce the expected branch (EXPECT_BRANCH; set to "" to skip),
+#   2. restore any tracked files a purge deleted from the work tree (from git),
+#   3. require the venv to exist (rebuilding it is a deliberate `uv sync`),
+#   4. ensure vLLM's nemotron_parse.py is present + patched -- the patch script
+#      self-restores it from .bak, and flock serializes the shared-venv write.
+# Any unrecoverable condition aborts here with actionable guidance.
+EXPECT_BRANCH="${EXPECT_BRANCH:-tim/pdf-to-interleaved-custom-scripts}"
+
+preflight() {
+  local dir="${CURATOR_DIR}"
+
+  if ! git -C "${dir}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "PREFLIGHT ERROR: ${dir} is not a git work tree." >&2
+    exit 1
+  fi
+
+  # Enforce the branch (checkout if needed; fails safely if the tree is dirty).
+  if [[ -n "${EXPECT_BRANCH}" ]]; then
+    local cur
+    cur="$(git -C "${dir}" symbolic-ref --short -q HEAD || echo DETACHED)"
+    if [[ "${cur}" != "${EXPECT_BRANCH}" ]]; then
+      echo "PREFLIGHT: on '${cur}', switching to '${EXPECT_BRANCH}'..." >&2
+      git -C "${dir}" checkout "${EXPECT_BRANCH}" || {
+        echo "PREFLIGHT ERROR: cannot checkout ${EXPECT_BRANCH}; commit/stash local changes first." >&2
+        exit 1
+      }
+    fi
+  fi
+
+  # Restore only DELETED tracked files (purge recovery) without clobbering
+  # intentional local edits to modified-but-present files.
+  local deleted
+  deleted="$(git -C "${dir}" ls-files --deleted)"
+  if [[ -n "${deleted}" ]]; then
+    echo "PREFLIGHT: restoring $(printf '%s\n' "${deleted}" | grep -c .) purged tracked file(s) from git..." >&2
+    # shellcheck disable=SC2086
+    ( cd "${dir}" && git checkout -- ${deleted} )
+  fi
+
+  local f
+  for f in "tutorials/interleaved/nemotron_parse_pdf/main.py" "scripts/patch_vllm_nemotron_parse.py"; do
+    [[ -f "${dir}/${f}" ]] || { echo "PREFLIGHT ERROR: ${dir}/${f} missing and git could not restore it." >&2; exit 1; }
+  done
+
+  if [[ ! -f "${dir}/.venv/bin/activate" ]]; then
+    echo "PREFLIGHT ERROR: no venv at ${dir}/.venv -- run: (cd '${dir}' && uv sync --extra interleaved_cuda12)" >&2
+    exit 1
+  fi
+
+  # Patch vLLM once here (self-restores nemotron_parse.py from .bak if a purge
+  # removed it) so the per-manifest srun patch is just a no-op confirmation.
+  ( cd "${dir}" && source .venv/bin/activate \
+      && flock "${dir}/.venv/.nemotron_parse_patch.lock" python scripts/patch_vllm_nemotron_parse.py ) || {
+    echo "PREFLIGHT ERROR: vLLM Nemotron-Parse patch failed (see message above)." >&2
+    exit 1
+  }
+
+  echo "PREFLIGHT OK: branch=${EXPECT_BRANCH:-<unchecked>}, code present, venv ready, vLLM patched."
+}
+
+preflight
+
 # ---- Slurm / scale knobs (override via env) ----------------------------------
 NUM_JOBS="${NUM_JOBS:-10}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
@@ -235,7 +301,12 @@ for MANIFEST in "\${MANIFESTS[@]}"; do
 
     # Re-apply the vLLM Nemotron-Parse shard-id fix in case the venv was
     # rebuilt by 'uv sync' since the last run (idempotent; no-op if patched).
-    python scripts/patch_vllm_nemotron_parse.py || true
+    # The venv is a SINGLE shared copy, so letting every node patch concurrently
+    # races and truncates nemotron_parse.py (breaks model inspection on all
+    # ranks). Serialize with a shared-FS lock: exactly one writer at a time; the
+    # rest then observe 'already patched' and no-op. Pre-patch once before submit
+    # so even the first holder just confirms the fix.
+    flock '${CURATOR_DIR}/.venv/.nemotron_parse_patch.lock' python scripts/patch_vllm_nemotron_parse.py || true
 
     export TMPDIR=/tmp/vllm_\${USER}
     export RAY_TMPDIR=/tmp/ray_\${SLURM_JOB_ID}

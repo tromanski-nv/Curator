@@ -3,7 +3,7 @@
 # Sets everything submit_nemotron_parse_pdf_chain.sh reads, plus PDF_ROOT/WORK
 # used by the manifest-gen and monitoring commands.
 
-set -gx CURATOR_DIR /lustre/fsw/portfolios/nemotron/users/tromanski/github/Curator
+set -gx CURATOR_DIR /home/tromanski/github/Curator-fork
 set -gx HF_HOME     /lustre/fsw/portfolios/nemotron/users/tromanski/hf_cache
 
 # Dataset + workspace

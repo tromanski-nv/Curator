@@ -2,7 +2,7 @@
 # Usage:  source scripts/env/arxiv.sh
 # Same vars as arxiv.fish, for on-node manifest generation / calibration.
 
-export CURATOR_DIR=/lustre/fsw/portfolios/nemotron/users/tromanski/github/Curator
+export CURATOR_DIR=/home/tromanski/github/Curator-fork
 export HF_HOME=/lustre/fsw/portfolios/nemotron/users/tromanski/hf_cache
 
 # Dataset + workspace

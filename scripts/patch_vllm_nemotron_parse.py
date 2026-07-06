@@ -56,8 +56,9 @@ def locate_nemotron_parse() -> Path | None:
     if spec is None or not spec.submodule_search_locations:
         return None
     vllm_dir = Path(next(iter(spec.submodule_search_locations)))
-    candidate = vllm_dir / "model_executor" / "models" / "nemotron_parse.py"
-    return candidate if candidate.is_file() else None
+    # Return the expected path whether or not it currently exists, so callers can
+    # restore it from the .bak backup if a filesystem purge removed the file.
+    return vllm_dir / "model_executor" / "models" / "nemotron_parse.py"
 
 
 def apply_patch(path: Path, *, make_backup: bool = True) -> str:
@@ -102,13 +103,28 @@ def main() -> int:
     args = parser.parse_args()
 
     path = Path(args.path) if args.path else locate_nemotron_parse()
-    if path is None or not path.is_file():
+    if path is None:
         print(
-            "ERROR: could not find vllm/model_executor/models/nemotron_parse.py. "
+            "ERROR: could not locate the vLLM package. "
             "Is vLLM installed in this environment? (activate the venv or use `uv run`).",
             file=sys.stderr,
         )
         return 1
+    if not path.is_file():
+        # A filesystem purge can delete the model file while its .bak backup
+        # survives. Restore from the backup so a re-run self-heals instead of
+        # failing with "failed to be inspected" on every rank.
+        backup = path.with_suffix(path.suffix + ".bak")
+        if backup.is_file():
+            print(f"{path} missing; restoring from {backup.name} before patching.", file=sys.stderr)
+            shutil.copy2(backup, path)
+        else:
+            print(
+                f"ERROR: {path} is missing and no {backup.name} exists to restore from. "
+                "Rebuild the environment: uv sync --extra interleaved_cuda12",
+                file=sys.stderr,
+            )
+            return 1
 
     result = apply_patch(path, make_backup=not args.no_backup)
     if result == "patched":

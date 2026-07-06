@@ -2,7 +2,7 @@
 # Usage:  source scripts/env/pubmed.fish
 # Scale knobs below are calibrated (~4.16 s/PDF) and overflow-safe (100 PDFs/task).
 
-set -gx CURATOR_DIR /lustre/fsw/portfolios/nemotron/users/tromanski/github/Curator
+set -gx CURATOR_DIR /home/tromanski/github/Curator-fork
 set -gx HF_HOME     /lustre/fsw/portfolios/nemotron/users/tromanski/hf_cache
 
 # Dataset + workspace
