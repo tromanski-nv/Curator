@@ -1,0 +1,57 @@
+---
+description: Prefer uv-native commands over pip (including uv pip) for package management
+alwaysApply: true
+---
+
+# Use uv Directly (not pip)
+
+This project is managed with `uv`. Always prefer uv-native project commands over
+`pip` or the `uv pip` compatibility layer. Reserve `uv pip ...` for the rare case
+where no native command fits (e.g. an ad-hoc, non-project package).
+
+## Command mapping
+
+| Task | Use (preferred) | Avoid |
+|------|-----------------|-------|
+| Add a dependency | `uv add <pkg>` | `pip install <pkg>`, `uv pip install <pkg>` |
+| Remove a dependency | `uv remove <pkg>` | `pip uninstall <pkg>` |
+| Install env from lock | `uv sync --extra interleaved_cuda12` | `pip install -r ...` |
+| Reinstall one (broken) package | `uv sync --reinstall-package <pkg>` | `uv pip install --reinstall <pkg>` |
+| Reinstall everything | `uv sync --reinstall` | — |
+| Run a command in the env | `uv run <cmd>` | `source .venv/bin/activate && <cmd>` |
+| Update the lockfile | `uv lock` | manual edits |
+
+## Shared venv on Slurm: use `uv run --no-sync` off the login node
+
+The `.venv` lives on shared Lustre and its `python` symlinks to each node's
+local `/cm/local/apps/python3`. System Python differs across nodes (e.g. login
+= 3.12.11, some GPU nodes = 3.12.13). A **bare `uv run` auto-syncs** and, when it
+sees the node's Python differs from the venv's recorded `version_info`, it tries
+to **rebuild the whole shared venv** — deleting packages (`vllm`, `ray`, ...) and
+often failing mid-delete on Lustre `.nfs*` leftovers, which corrupts the venv for
+every running job that shares it.
+
+- On any Slurm compute node, run against the shared venv with **`uv run --no-sync`**
+  (cp312 wheels are ABI-compatible across 3.12.x, so they run fine regardless of
+  the patch version). Bare `uv run` is only safe where the node Python matches the
+  venv (the login node).
+- **Ray pipelines (Curator/cosmos_xenna): do NOT use `uv run` at all — use
+  `source .venv/bin/activate && python ...`.** Ray 2.55 auto-detects a `uv run`
+  driver and relaunches its workers with a *bare* `uv run` (it does NOT propagate
+  `--no-sync`), which on a mismatched-Python node tries to recreate the venv and
+  the worker fails with `ModuleNotFoundError: No module named 'ray'`. Activating
+  makes Ray launch workers via `sys.executable` (`.venv/bin/python`) with no uv.
+- Long-running production jobs should `source .venv/bin/activate && python ...`
+  (as the submit scripts do) — activate never rebuilds the venv.
+- Never run a bare `uv run`/`uv sync` against the shared venv while chain jobs are
+  using it; cancel the jobs first, repair from the login node, then resubmit.
+
+## Notes
+
+- `uv sync` prunes anything not in the selected extras/groups — always pass the
+  same extras used originally (here: `--extra interleaved_cuda12`) so it does not
+  remove GPU deps like `vllm`.
+- Any in-place patch to an installed package (e.g. the vLLM Nemotron-Parse fix in
+  `scripts/patch_vllm_nemotron_parse.py`) is wiped by `uv sync --reinstall` /
+  `uv sync --reinstall-package vllm`; re-run the patch script afterward.
+- `uv pip install` is a last resort; if you use it, say why in the message.

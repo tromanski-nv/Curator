@@ -77,9 +77,16 @@ class RangeReader:
 
 
 class S3RangeReader(RangeReader):
-    """Range reader backed by S3 via boto3 (lazy-imported).
-    Credentials, region, and endpoint are resolved by boto3's standard chain
-    (``AWS_*`` env vars, ``~/.aws/`` config, instance profiles).
+    """Range reader backed by S3 (or S3-compatible) storage via boto3 (lazy-imported).
+
+    Credentials and region are resolved by boto3's standard chain (``AWS_*`` env
+    vars, ``~/.aws/`` config, instance profiles). For S3-compatible object stores
+    (SwiftStack, MinIO, ...) set ``endpoint_url`` or the ``AWS_ENDPOINT_URL`` env
+    var, e.g. ``endpoint_url="https://pdx.s8k.io"``.
+
+    Note: range-reading record metadata only works on *uncompressed* WARCs (or
+    per-record-gzipped WARCs with a CDX offset index). For whole-file ``.warc.gz``
+    use the streaming path (``s3_streaming.S3WarcStreamStage``) instead.
     """
 
     def __init__(
@@ -87,11 +94,15 @@ class S3RangeReader(RangeReader):
         bucket: str,
         *,
         client: Any = None,  # noqa: ANN401 - boto3 S3 client has no type stubs
+        endpoint_url: str | None = None,
+        region: str | None = None,
         max_retries: int = 3,
         timeout: int = 30,
     ) -> None:
         super().__init__()
         self.bucket = bucket
+        self.endpoint_url = endpoint_url
+        self.region = region
         self.max_retries = max_retries
         self.timeout = timeout
         self._client = client
@@ -110,7 +121,8 @@ class S3RangeReader(RangeReader):
                 connect_timeout=self.timeout,
                 read_timeout=self.timeout,
             )
-            self._client = boto3.client("s3", config=boto_cfg)
+            endpoint = self.endpoint_url or os.environ.get("AWS_ENDPOINT_URL") or None
+            self._client = boto3.client("s3", config=boto_cfg, endpoint_url=endpoint, region_name=self.region)
         return self._client
 
     def size(self, key: str) -> int:

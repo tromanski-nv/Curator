@@ -16,9 +16,18 @@
 #   EAI_WARC_DIR=/shared/warcs EAI_OUTPUT_DIR=/shared/out \
 #       sbatch --nodes=4 tutorials/eai_crawl/submit.sh
 #
-# Usage (S3 source):
-#   EAI_S3_BUCKET=my-bucket EAI_S3_PREFIX=crawl/warcs/ EAI_OUTPUT_DIR=/shared/out \
+# Usage (S3/SwiftStack, compressed .warc.gz -> STREAMING):
+#   EAI_S3_BUCKET=vdi-169-essentialai-essentialai-data \
+#   EAI_S3_PREFIX=eai-warc/20240814/ \
+#   EAI_S3_ENDPOINT_URL=https://pdx.s8k.io \
+#   EAI_STREAM=1 \
+#   AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
+#   EAI_OUTPUT_DIR=/shared/out \
 #       sbatch --nodes=4 tutorials/eai_crawl/submit.sh
+#
+# Tip for the full 3 PiB crawl: submit one job (or array task) per day-prefix
+# (eai-warc/<YYYYMMDD>/) and write to EAI_OUTPUT_DIR/<day>/ so runs are
+# independently sized, checkpointable, and resumable.
 # =============================================================================
 
 #SBATCH --job-name=eai-warc-pdf
@@ -42,11 +51,16 @@ EAI_OUTPUT_DIR="${EAI_OUTPUT_DIR:?Set EAI_OUTPUT_DIR to a shared output director
 EAI_WARC_DIR="${EAI_WARC_DIR:-}"
 EAI_S3_BUCKET="${EAI_S3_BUCKET:-}"
 EAI_S3_PREFIX="${EAI_S3_PREFIX:-}"
+EAI_S3_ENDPOINT_URL="${EAI_S3_ENDPOINT_URL:-}"
+EAI_STREAM="${EAI_STREAM:-}"
 EAI_URL_LIMIT="${EAI_URL_LIMIT:-}"
 
 # Build source-specific args.
 if [[ -n "${EAI_S3_BUCKET}" ]]; then
     SOURCE_ARGS="--s3-bucket ${EAI_S3_BUCKET} --s3-prefix ${EAI_S3_PREFIX}"
+    [[ -n "${EAI_S3_ENDPOINT_URL}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --s3-endpoint-url ${EAI_S3_ENDPOINT_URL}"
+    # Streaming is required for compressed .warc.gz (e.g. the EAI crawl).
+    [[ -n "${EAI_STREAM}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --stream"
 elif [[ -n "${EAI_WARC_DIR}" ]]; then
     SOURCE_ARGS="--warc-dir ${EAI_WARC_DIR}"
 else
@@ -71,11 +85,12 @@ srun \
 cd '${CURATOR_DIR}'
 export RAY_TMPDIR=/tmp/ray_\${SLURM_JOB_ID}
 export RAY_PORT_BROADCAST_DIR='${CURATOR_DIR}/logs'
-# Forward AWS credentials to workers for S3 mode (no-op if unset).
+# Forward AWS credentials + endpoint to workers for S3 mode (no-op if unset).
 export AWS_ACCESS_KEY_ID='${AWS_ACCESS_KEY_ID:-}'
 export AWS_SECRET_ACCESS_KEY='${AWS_SECRET_ACCESS_KEY:-}'
 export AWS_SESSION_TOKEN='${AWS_SESSION_TOKEN:-}'
 export AWS_DEFAULT_REGION='${AWS_DEFAULT_REGION:-}'
+export AWS_ENDPOINT_URL='${EAI_S3_ENDPOINT_URL:-${AWS_ENDPOINT_URL:-}}'
 echo \"[\$(hostname)] SLURM_NODEID=\${SLURM_NODEID} python=\$(uv run python --version 2>&1)\"
 uv run --extra text_cpu python '${CURATOR_DIR}/tutorials/eai_crawl/run_slurm.py' \
     --slurm \

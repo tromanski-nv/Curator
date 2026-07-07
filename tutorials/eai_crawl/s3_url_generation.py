@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,18 +25,24 @@ from nemo_curator.stages.text.download import URLGenerator
 
 @dataclass
 class S3WarcUrlGenerator(URLGenerator):
-    """List WARC object keys under an S3 prefix.
+    """List WARC object keys under an S3 (or S3-compatible) prefix.
 
-    Returns plain object keys (not ``s3://`` URLs); the downstream
-    ``S3WarcMetadataStage`` pairs each key with the bucket for range reads.
-    Credentials are resolved by boto3's default chain unless ``client`` is
+    Returns plain object keys (not ``s3://`` URLs); the downstream stage pairs
+    each key with the bucket to read the object. Credentials are resolved by
+    boto3's default chain (``AWS_*`` env vars, ``~/.aws/``) unless ``client`` is
     injected (useful for tests).
+
+    For S3-compatible object stores (SwiftStack, MinIO, Ceph, ...), set
+    ``endpoint_url`` (or the ``AWS_ENDPOINT_URL`` env var). Example SwiftStack:
+    ``endpoint_url="https://pdx.s8k.io"``.
     """
 
     bucket: str
     prefix: str = ""
     suffix: str = ".warc"  # matches both ".warc" and ".warc.gz"
     limit: int | None = None
+    endpoint_url: str | None = None
+    region: str | None = None
     client: Any = None
 
     def _get_client(self) -> Any:  # noqa: ANN401 - boto3 S3 client has no type stubs
@@ -46,7 +53,8 @@ class S3WarcUrlGenerator(URLGenerator):
         except ModuleNotFoundError as exc:
             msg = "boto3 is required for S3WarcUrlGenerator. Install with: pip install boto3"
             raise RuntimeError(msg) from exc
-        return boto3.client("s3")
+        endpoint = self.endpoint_url or os.environ.get("AWS_ENDPOINT_URL") or None
+        return boto3.client("s3", endpoint_url=endpoint, region_name=self.region)
 
     def generate_urls(self) -> list[str]:
         client = self._get_client()

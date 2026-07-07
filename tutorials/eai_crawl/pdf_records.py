@@ -15,7 +15,7 @@
 import logging
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 from urllib.parse import unquote, urlparse
 
 logger = logging.getLogger(__name__)
@@ -46,55 +46,71 @@ PDF_OUTPUT_COLUMNS = [
 
 
 def iterate_pdf_warc_records(file_path: str) -> Iterator[dict[str, Any]]:
-    """Yield application/pdf WARC response metadata without reading PDF payloads."""
+    """Yield application/pdf WARC response metadata without reading PDF payloads.
+
+    Opens ``file_path`` (a local ``.warc`` or ``.warc.gz``) and delegates to
+    :func:`iterate_pdf_warc_stream`.
+    """
+    filename = file_path.name if isinstance(file_path, Path) else file_path.split("/")[-1]
+    with open(file_path, "rb") as file_pointer:
+        yield from iterate_pdf_warc_stream(file_pointer, source_name=filename)
+
+
+def iterate_pdf_warc_stream(stream: IO[bytes], source_name: str) -> Iterator[dict[str, Any]]:
+    """Yield application/pdf WARC response metadata from an open binary stream.
+
+    Works on any file-like object opened in binary mode, including a boto3
+    ``StreamingBody`` from ``get_object`` (S3/SwiftStack). ``warcio`` transparently
+    decodes both ``.warc`` and whole-file/per-record gzipped ``.warc.gz`` streams,
+    so this is the correct path for compressed WARCs (which cannot be range-read).
+
+    ``source_name`` is recorded as ``source_id`` (typically the object key/filename).
+    """
     from warcio.archiveiterator import ArchiveIterator
 
-    filename = file_path.name if isinstance(file_path, Path) else file_path.split("/")[-1]
     num_records = 0
-
-    with open(file_path, "rb") as file_pointer:
-        archive_iterator = ArchiveIterator(file_pointer, arc2warc=True)
-        while True:
-            try:
-                record = next(archive_iterator)
-                if record.rec_type != "response":
-                    continue
-
-                http_headers = record.http_headers
-                if http_headers is None:
-                    continue
-
-                content_type = (http_headers.get_header("Content-Type") or "").lower()
-                if PDF_CONTENT_TYPE not in content_type:
-                    continue
-
-                warc_record_id = record.rec_headers.get_header("WARC-Record-ID")
-                if warc_record_id is None:
-                    logger.warning(f"Skipping PDF response without WARC-Record-ID in {filename}")
-                    continue
-
-                content_length = record.payload_length
-                if content_length is None:
-                    raw_length = http_headers.get_header("Content-Length")
-                    content_length = int(raw_length) if raw_length and raw_length.isdigit() else None
-
-                warc_id = warc_record_id[10:-1]
-                url = record.rec_headers.get_header("WARC-Target-URI")
-                yield {
-                    "url": url,
-                    "warc_id": warc_id,
-                    "source_id": filename,
-                    "content_type": content_type.split(";", 1)[0].strip(),
-                    "content_length": content_length,
-                    "http_status": http_headers.get_statuscode(),
-                    "warc_date": record.rec_headers.get_header("WARC-Date"),
-                }
-                num_records += 1
-            except StopIteration:
-                break
-            except Exception:
-                logger.exception(f"Error processing record {num_records} in {filename}")
+    archive_iterator = ArchiveIterator(stream, arc2warc=True)
+    while True:
+        try:
+            record = next(archive_iterator)
+            if record.rec_type != "response":
                 continue
+
+            http_headers = record.http_headers
+            if http_headers is None:
+                continue
+
+            content_type = (http_headers.get_header("Content-Type") or "").lower()
+            if PDF_CONTENT_TYPE not in content_type:
+                continue
+
+            warc_record_id = record.rec_headers.get_header("WARC-Record-ID")
+            if warc_record_id is None:
+                logger.warning(f"Skipping PDF response without WARC-Record-ID in {source_name}")
+                continue
+
+            content_length = record.payload_length
+            if content_length is None:
+                raw_length = http_headers.get_header("Content-Length")
+                content_length = int(raw_length) if raw_length and raw_length.isdigit() else None
+
+            warc_id = warc_record_id[10:-1]
+            url = record.rec_headers.get_header("WARC-Target-URI")
+            yield {
+                "url": url,
+                "warc_id": warc_id,
+                "source_id": source_name,
+                "content_type": content_type.split(";", 1)[0].strip(),
+                "content_length": content_length,
+                "http_status": http_headers.get_statuscode(),
+                "warc_date": record.rec_headers.get_header("WARC-Date"),
+            }
+            num_records += 1
+        except StopIteration:
+            break
+        except Exception:
+            logger.exception(f"Error processing record {num_records} in {source_name}")
+            continue
 
 
 def filename_from_url(url: str) -> str:
