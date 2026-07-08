@@ -245,11 +245,6 @@ echo "  DATASET=${DATASET}"
 echo "  OUTPUT=${OUTPUT}"
 echo "============================================================"
 
-# Created here so the per-manifest srun below (which exports the same path as
-# RAY_PORT_BROADCAST_DIR) can rely on it existing.
-RAY_PORT_BROADCAST_DIR="${OUTPUT}/ray_ports/\${SLURM_JOB_ID}"
-mkdir -p "\${RAY_PORT_BROADCAST_DIR}"
-
 # Per-manifest .done markers let chained jobs skip finished work without paying
 # a fresh Ray/vLLM bring-up just to find --skip-existing has nothing to do.
 DONE_DIR='${OUTPUT}/done_markers'
@@ -258,6 +253,7 @@ mkdir -p "\${DONE_DIR}"
 MANIFESTS_OK=0
 MANIFESTS_FAILED=0
 MANIFESTS_SKIPPED=0
+MANIFESTS_RETIRED=0
 
 shopt -s nullglob
 MANIFESTS=( '${MANIFEST_DIR}'/*.manifest.jsonl )
@@ -272,28 +268,54 @@ for MANIFEST in "\${MANIFESTS[@]}"; do
   echo "------------------------------------------------------------"
 
   MANIFEST_DONE="\${DONE_DIR}/\$(basename "\${MANIFEST}").done"
+  MANIFEST_RETIRED="\${DONE_DIR}/\$(basename "\${MANIFEST}").retired"
   if [[ -f "\${MANIFEST_DONE}" ]]; then
     echo "Skipping \${MANIFEST} (already completed: \${MANIFEST_DONE})"
     MANIFESTS_SKIPPED=\$((MANIFESTS_SKIPPED + 1))
     continue
   fi
+  # ".retired" means this manifest failed MAX_RETRIES times and its remaining
+  # PDFs are UNPROCESSED (NOT the same as ".done"). It is paused, not lost:
+  # delete the .retired file to have the next chain job retry it.
+  if [[ -f "\${MANIFEST_RETIRED}" ]]; then
+    echo "RETIRED (NOT processed -- needs attention): \${MANIFEST}. rm \${MANIFEST_RETIRED} to retry."
+    MANIFESTS_RETIRED=\$((MANIFESTS_RETIRED + 1))
+    continue
+  fi
 
-  # Auto-retire manifests whose remaining PDFs are permanently unprocessable
-  # (e.g. every PDF times out or produces 0 output, so srun always exits non-zero
-  # even though there is genuinely nothing left to do).
+  # After MAX_RETRIES consecutive failures, PAUSE this manifest by writing a
+  # ".retired" breadcrumb -- NEVER a ".done". Failures here are almost always
+  # transient infra (EADDRINUSE/OOM); per-PDF errors are already tolerated by the
+  # executor (ignore_failures), so a non-zero exit means "retry", not "done".
+  # The old behavior (touch .done) silently dropped a manifest's remaining PDFs.
+  # Retired manifests are surfaced loudly in the summary and re-run as soon as the
+  # operator deletes the .retired file, so nothing is lost without a visible trail.
   MANIFEST_FAILS_FILE="\${DONE_DIR}/\$(basename "\${MANIFEST}").fails"
   MANIFEST_FAIL_COUNT=\$(cat "\${MANIFEST_FAILS_FILE}" 2>/dev/null || echo 0)
   MAX_RETRIES="${MAX_RETRIES}"
   if [[ \${MANIFEST_FAIL_COUNT} -ge \${MAX_RETRIES} ]]; then
-    echo "WARNING: \${MANIFEST} has failed \${MANIFEST_FAIL_COUNT}/${MAX_RETRIES} times in a row; marking done and skipping (remaining PDFs are likely permanently unprocessable)"
-    touch "\${MANIFEST_DONE}"
+    echo "WARNING: \${MANIFEST} failed \${MANIFEST_FAIL_COUNT}/${MAX_RETRIES} times in a row; RETIRING (NOT done) -- remaining PDFs are UNPROCESSED. rm \${MANIFEST_RETIRED} to retry."
+    date +%s > "\${MANIFEST_RETIRED}"
     rm -f "\${MANIFEST_FAILS_FILE}"
-    MANIFESTS_SKIPPED=\$((MANIFESTS_SKIPPED + 1))
+    MANIFESTS_RETIRED=\$((MANIFESTS_RETIRED + 1))
     continue
   fi
 
   echo "Processing \${MANIFEST} (consecutive failures so far: \${MANIFEST_FAIL_COUNT})"
 
+  # Give EACH manifest its own Ray port-broadcast dir. A shared dir lets a worker
+  # read a STALE head-node port left by the previous manifest and try to bind it,
+  # which surfaces as EADDRINUSE. Emptying a fresh per-manifest dir guarantees the
+  # next cluster negotiates its own ports from scratch.
+  MANIFEST_TAG="\$(basename "\${MANIFEST}" .manifest.jsonl)"
+  MANIFEST_PORTDIR="${OUTPUT}/ray_ports/\${SLURM_JOB_ID}_\${MANIFEST_TAG}"
+  rm -rf "\${MANIFEST_PORTDIR}"
+  mkdir -p "\${MANIFEST_PORTDIR}"
+
+  # Capture this manifest's combined output so we can consult the rank-0 driver's
+  # own verdict after srun returns (see the RC-override note below). tee keeps the
+  # live stream flowing to the job's stdout for monitoring.
+  MANIFEST_LOG="\$(mktemp)"
   set +e
   srun --ntasks-per-node=1 bash -c "
     set -euo pipefail
@@ -310,7 +332,7 @@ for MANIFEST in "\${MANIFESTS[@]}"; do
     ray stop --force >/dev/null 2>&1 || true
     pkill -9 -f '[E]ngineCore' >/dev/null 2>&1 || true
     pkill -9 -f '[r]ay::' >/dev/null 2>&1 || true
-    sleep 15
+    sleep 30
 
     # Re-apply the vLLM Nemotron-Parse shard-id fix in case the venv was
     # rebuilt by 'uv sync' since the last run (idempotent; no-op if patched).
@@ -326,7 +348,7 @@ for MANIFEST in "\${MANIFESTS[@]}"; do
     mkdir -p /tmp/vllm_\${USER} /tmp/ray_\${SLURM_JOB_ID}
     export HF_HOME='${HF_HOME}'
     export HF_HUB_CACHE=\${HF_HOME}/hub
-    export RAY_PORT_BROADCAST_DIR='${OUTPUT}/ray_ports/\${SLURM_JOB_ID}'
+    export RAY_PORT_BROADCAST_DIR='\${MANIFEST_PORTDIR}'
 
     echo \"[\$(hostname)] SLURM_JOB_ID=\${SLURM_JOB_ID} SLURM_NODEID=\${SLURM_NODEID} SLURM_NNODES=\${SLURM_NNODES} SLURM_CPUS_ON_NODE=\${SLURM_CPUS_ON_NODE}\"
 
@@ -338,9 +360,23 @@ for MANIFEST in "\${MANIFESTS[@]}"; do
       --enforce-eager \\
       --skip-existing \\
       --pdfs-per-task ${PDFS_PER_TASK} ${EXTRA_ARGS}
-  "
-  RC=\$?
+  " 2>&1 | tee "\${MANIFEST_LOG}"
+  RC=\${PIPESTATUS[0]}
   set -e
+
+  # srun returns non-zero whenever ANY task exits non-zero -- and Curator's
+  # SlurmRayClient worker (_run_as_worker) routinely exits code 1 during Ray
+  # teardown right after the rank-0 driver finishes the pipeline. srun then tears
+  # the whole step down (StepId ... Terminated -> RC 1/143) even though the run
+  # succeeded and all output parquets were already written. The driver's own
+  # "Pipeline finished in ..." log line is the source of truth, so if it is
+  # present we treat the manifest as done regardless of the worker-teardown code.
+  # A genuine driver crash never prints that line, so real failures still retry.
+  if [[ \${RC} -ne 0 ]] && grep -q "Pipeline finished in" "\${MANIFEST_LOG}"; then
+    echo "NOTE: srun RC=\${RC} but rank-0 driver reported a clean pipeline finish; treating \${MANIFEST} as success (benign Ray worker teardown)."
+    RC=0
+  fi
+  rm -f "\${MANIFEST_LOG}"
 
   if [[ \${RC} -eq 0 ]]; then
     MANIFESTS_OK=\$((MANIFESTS_OK + 1))
@@ -355,7 +391,11 @@ for MANIFEST in "\${MANIFESTS[@]}"; do
 done
 
 echo "============================================================"
-echo "  Job ${CHAIN_IDX}/${NUM_JOBS} summary: ok=\${MANIFESTS_OK} failed=\${MANIFESTS_FAILED} skipped=\${MANIFESTS_SKIPPED}"
+echo "  Job ${CHAIN_IDX}/${NUM_JOBS} summary: ok=\${MANIFESTS_OK} failed=\${MANIFESTS_FAILED} skipped=\${MANIFESTS_SKIPPED} retired=\${MANIFESTS_RETIRED}"
+if [[ \${MANIFESTS_RETIRED} -gt 0 ]]; then
+  echo "  !! \${MANIFESTS_RETIRED} manifest(s) RETIRED (remaining PDFs UNPROCESSED). To retry them:"
+  echo "     find '\${DONE_DIR}' -name '*.retired' -delete"
+fi
 echo "============================================================"
 
 # Fail the Slurm job when any manifest failed so afterok stops the chain.
