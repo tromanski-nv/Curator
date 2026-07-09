@@ -18,6 +18,8 @@ import sys
 import types
 from typing import IO
 
+import pytest
+
 from nemo_curator.tasks import FileGroupTask
 from tests.tutorials.eai_crawl.test_s3_download import _make_record
 from tutorials.eai_crawl.s3_streaming import (
@@ -141,7 +143,7 @@ class TestS3WarcStreamStage:
 
         assert len(stage.process(task).to_pandas()) == 2
 
-    def test_bad_object_is_skipped(self) -> None:
+    def test_bad_object_fails_the_task(self) -> None:
         class _Boom(ObjectStreamer):
             def open(self, key: str) -> IO[bytes]:
                 msg = "network error"
@@ -150,14 +152,14 @@ class TestS3WarcStreamStage:
         stage = S3WarcStreamStage(streamer=_Boom())
         task = FileGroupTask(dataset_name="eai", data=["broken.warc.gz"], _metadata={})
 
-        df = stage.process(task).to_pandas()
-        assert len(df) == 0
+        with pytest.raises(RuntimeError, match="network error"):
+            stage.process(task)
 
-    def test_requires_bucket_when_no_streamer(self) -> None:
+    def test_missing_bucket_fails_the_task(self) -> None:
         stage = S3WarcStreamStage()
         task = FileGroupTask(dataset_name="eai", data=["s.warc.gz"], _metadata={})
-        # Missing bucket -> the object is skipped (error is caught per-object).
-        assert len(stage.process(task).to_pandas()) == 0
+        with pytest.raises(ValueError, match="requires a bucket"):
+            stage.process(task)
 
 
 class TestS3StreamEaiCrawlStage:

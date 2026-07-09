@@ -215,9 +215,9 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
                     if self.add_filename_column:
                         extracted[self.filename_col] = os.path.basename(key)
                     rows.append(extracted)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception(f"Failed streaming WARC object {key}")
-                continue
+                raise
 
         return DocumentBatch(
             dataset_name=task.dataset_name,

@@ -198,7 +198,7 @@ def iterate_cdx_and_pdfs(
             break
         except Exception:
             logger.exception(f"Error reading record {result.num_records} in {warc_filename}")
-            continue
+            raise
 
         result.num_records += 1
         rec_type = record.rec_type or ""
