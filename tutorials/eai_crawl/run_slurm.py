@@ -93,6 +93,13 @@ def parse_args() -> argparse.Namespace:
         help="Parquet output dir (local path or s3://bucket/prefix/, e.g. s3://eai-warcs/pdf_url_idx/20240814/)",
     )
     parser.add_argument("--url-limit", type=int, default=None, help="Max WARC files/objects to process")
+    parser.add_argument(
+        "--s3-keys-file",
+        default=None,
+        help="File with one S3 object key per line (S3 --stream mode). Bypasses prefix listing so "
+        "one job can process a byte-sized chunk of WARCs spanning multiple days. Blank lines and "
+        "'#' comments are ignored.",
+    )
     parser.add_argument("--record-limit", type=int, default=None, help="Max PDF records per WARC")
     parser.add_argument("--header-bytes", type=int, default=16384, help="Bytes per record range read (S3 range mode)")
     parser.add_argument(
@@ -108,6 +115,21 @@ def parse_args() -> argparse.Namespace:
         "--cdx-output-dir are s3:// and EAI_OUT_AWS_* are unset.",
     )
     return parser.parse_args()
+
+
+def _load_keys_file(path: str) -> list[str]:
+    """Read S3 object keys (one per line) from a chunk manifest; skip blanks/comments."""
+    keys: list[str] = []
+    with open(path) as fh:
+        for raw in fh:
+            line = raw.strip()
+            if line and not line.startswith("#"):
+                keys.append(line)
+    if not keys:
+        msg = f"--s3-keys-file {path} contained no usable keys"
+        raise SystemExit(msg)
+    logger.info(f"Loaded {len(keys)} WARC key(s) from {path}")
+    return keys
 
 
 def build_pipeline(args: argparse.Namespace) -> Pipeline:
@@ -129,6 +151,11 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
             )
             raise SystemExit(msg)
 
+    keys = _load_keys_file(args.s3_keys_file) if args.s3_keys_file else None
+    if args.s3_keys_file and not (args.s3_bucket and args.stream):
+        msg = "--s3-keys-file requires --s3-bucket and --stream"
+        raise SystemExit(msg)
+
     if args.s3_bucket and args.stream:
         from tutorials.eai_crawl.s3_streaming import S3StreamEaiCrawlStage
 
@@ -143,6 +170,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
                 record_limit=args.record_limit,
                 cdx_output_dir=args.cdx_output_dir,
                 cdx_storage_options=write_opts if args.cdx_output_dir and is_remote_url(args.cdx_output_dir) else None,
+                keys=keys,
             )
         )
     elif args.s3_bucket:

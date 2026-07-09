@@ -72,6 +72,9 @@ EAI_STREAM="${EAI_STREAM:-}"
 EAI_URL_LIMIT="${EAI_URL_LIMIT:-}"
 EAI_CDX_OUTPUT_DIR="${EAI_CDX_OUTPUT_DIR:-}"
 EAI_OUTPUT_RCLONE_REMOTE="${EAI_OUTPUT_RCLONE_REMOTE:-}"
+# Optional byte-chunk manifest: file of WARC keys (one per line) spanning any days.
+# Must live on a shared FS (Lustre) so the head node can read it at run time.
+EAI_S3_KEYS_FILE="${EAI_S3_KEYS_FILE:-}"
 
 # Build source-specific args.
 if [[ -n "${EAI_S3_BUCKET}" ]]; then
@@ -79,6 +82,7 @@ if [[ -n "${EAI_S3_BUCKET}" ]]; then
     [[ -n "${EAI_S3_ENDPOINT_URL}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --s3-endpoint-url ${EAI_S3_ENDPOINT_URL}"
     # Streaming is required for compressed .warc.gz (e.g. the EAI crawl).
     [[ -n "${EAI_STREAM}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --stream"
+    [[ -n "${EAI_S3_KEYS_FILE}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --s3-keys-file ${EAI_S3_KEYS_FILE}"
 elif [[ -n "${EAI_WARC_DIR}" ]]; then
     SOURCE_ARGS="--warc-dir ${EAI_WARC_DIR}"
 else
@@ -98,6 +102,10 @@ if [[ -n "${EAI_S3_BUCKET}" && -z "${AWS_ACCESS_KEY_ID:-}" ]]; then
     echo "    export AWS_SECRET_ACCESS_KEY=\$(rclone config show team-vendor-data | sed -n 's/^secret_access_key = //p')" >&2
     exit 1
 fi
+if [[ -n "${EAI_S3_KEYS_FILE}" && ! -f "${EAI_S3_KEYS_FILE}" ]]; then
+    echo "ERROR: EAI_S3_KEYS_FILE=${EAI_S3_KEYS_FILE} not found (must be on a shared FS)." >&2
+    exit 1
+fi
 
 echo "=================================================="
 echo "  EAI WARC -> PDF URL pipeline (SLURM)"
@@ -106,6 +114,7 @@ echo "  Nodes  : ${SLURM_JOB_NODELIST} (${SLURM_JOB_NUM_NODES} nodes)"
 echo "  Dir    : ${CURATOR_DIR}"
 echo "  Venv   : ${VENV_PATH}"
 echo "  Source : ${SOURCE_ARGS}"
+echo "  Keys   : ${EAI_S3_KEYS_FILE:-"(prefix listing)"}"
 echo "  Output : ${EAI_OUTPUT_DIR}"
 echo "  CDX    : ${EAI_CDX_OUTPUT_DIR:-"(disabled)"}"
 echo "=================================================="

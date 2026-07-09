@@ -44,6 +44,9 @@ class S3WarcUrlGenerator(URLGenerator):
     endpoint_url: str | None = None
     region: str | None = None
     client: Any = None
+    # Explicit object keys (bypass listing). Used by the byte-chunk driver so a
+    # single job can process an arbitrary set of WARCs spanning multiple days.
+    keys: list[str] | None = None
 
     def _get_client(self) -> Any:  # noqa: ANN401 - boto3 S3 client has no type stubs
         if self.client is not None:
@@ -64,8 +67,17 @@ class S3WarcUrlGenerator(URLGenerator):
         )
 
     def generate_urls(self) -> list[str]:
+        # Explicit-keys mode: trust the provided manifest (already filtered/sorted
+        # by the driver); skip the S3 LIST entirely.
+        if self.keys is not None:
+            keys = list(self.keys)
+            if self.limit:
+                keys = keys[: self.limit]
+            logger.info(f"Using {len(keys)} explicit WARC key(s) for s3://{self.bucket}")
+            return keys
+
         client = self._get_client()
-        keys: list[str] = []
+        keys = []
         paginator = client.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=self.bucket, Prefix=self.prefix):
             for obj in page.get("Contents", []):
