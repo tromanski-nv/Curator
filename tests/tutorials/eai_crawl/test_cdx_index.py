@@ -15,6 +15,8 @@
 import gzip
 import io
 
+import pytest
+
 from tests.tutorials.eai_crawl.test_s3_download import _make_record
 from tutorials.eai_crawl.cdx_index import iterate_cdx_and_pdfs
 
@@ -49,6 +51,26 @@ def _per_record_gzip(warc: bytes) -> bytes:
 
 
 class TestIterateCdxAndPdfs:
+    def test_record_parse_error_is_not_silenced(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _FailingArchive:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __next__(self):
+                self.calls += 1
+                if self.calls == 1:
+                    msg = "corrupt record"
+                    raise RuntimeError(msg)
+                raise StopIteration
+
+        monkeypatch.setattr(
+            "warcio.archiveiterator.ArchiveIterator",
+            lambda *_args, **_kwargs: _FailingArchive(),
+        )
+
+        with pytest.raises(RuntimeError, match="corrupt record"):
+            iterate_cdx_and_pdfs(io.BytesIO(b""), warc_filename="broken.warc", detect_layout=False)
+
     def test_uncompressed_emits_cdx_and_pdf_rows(self) -> None:
         warc = _two_record_warc()
         result = iterate_cdx_and_pdfs(io.BytesIO(warc), warc_filename="sample.warc", detect_layout=True)
