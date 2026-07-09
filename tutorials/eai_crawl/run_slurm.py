@@ -62,12 +62,23 @@ from tutorials.eai_crawl.stage import EaiCrawlDownloadExtractStage  # noqa: E402
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--slurm", action="store_true", help="Use SlurmRayClient (set when running via srun)")
+    parser.add_argument(
+        "--ray-num-cpus",
+        type=int,
+        default=None,
+        help="CPUs advertised by a one-node RayClient (submit.sh passes SLURM_CPUS_PER_TASK)",
+    )
 
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--warc-dir", help="Directory of local/shared-FS WARC files")
     source.add_argument("--s3-bucket", help="S3/S3-compatible bucket holding WARC objects")
 
     parser.add_argument("--s3-prefix", default="", help="S3 key prefix to list under (with --s3-bucket)")
+    parser.add_argument(
+        "--s3-key-file",
+        default=None,
+        help="Exact newline-delimited S3 keys for one array shard; bypasses prefix listing",
+    )
     parser.add_argument(
         "--s3-endpoint-url",
         default=None,
@@ -107,7 +118,18 @@ def parse_args() -> argparse.Namespace:
         help="rclone remote name for S3 writes (e.g. eai-data). Used when --output-dir / "
         "--cdx-output-dir are s3:// and EAI_OUT_AWS_* are unset.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.s3_key_file and not args.s3_bucket:
+        parser.error("--s3-key-file requires --s3-bucket")
+    if args.s3_key_file and not args.stream:
+        parser.error("--s3-key-file is supported only with --stream")
+    if args.s3_key_file and args.url_limit is not None:
+        parser.error("--s3-key-file cannot be combined with --url-limit")
+    if args.ray_num_cpus is not None and args.ray_num_cpus < 1:
+        parser.error("--ray-num-cpus must be a positive integer")
+    if args.slurm and args.ray_num_cpus is not None:
+        parser.error("--ray-num-cpus is only valid with the one-node RayClient")
+    return args
 
 
 def build_pipeline(args: argparse.Namespace) -> Pipeline:
@@ -143,6 +165,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
                 record_limit=args.record_limit,
                 cdx_output_dir=args.cdx_output_dir,
                 cdx_storage_options=write_opts if args.cdx_output_dir and is_remote_url(args.cdx_output_dir) else None,
+                key_file=args.s3_key_file,
             )
         )
     elif args.s3_bucket:
@@ -183,8 +206,10 @@ def main() -> int:
     ray_temp_dir = os.environ.get("RAY_TMPDIR", DEFAULT_RAY_TEMP_DIR)
     os.makedirs(ray_temp_dir, exist_ok=True)
 
-    client_cls = SlurmRayClient if args.slurm else RayClient
-    ray_client = client_cls(ray_temp_dir=ray_temp_dir)
+    if args.slurm:
+        ray_client = SlurmRayClient(ray_temp_dir=ray_temp_dir)
+    else:
+        ray_client = RayClient(ray_temp_dir=ray_temp_dir, num_cpus=args.ray_num_cpus)
     ray_client.start()
     # On SLURM worker nodes (SLURM_NODEID > 0) start() blocks; only the head continues.
 

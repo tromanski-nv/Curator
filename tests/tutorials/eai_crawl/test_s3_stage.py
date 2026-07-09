@@ -12,10 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
+import pytest
+
 from nemo_curator.tasks import FileGroupTask
 from tests.tutorials.eai_crawl.test_s3_download import _make_record
 from tutorials.eai_crawl.s3_download import BytesRangeReader
 from tutorials.eai_crawl.s3_stage import S3EaiCrawlStage, S3WarcMetadataStage
+from tutorials.eai_crawl.s3_streaming import S3StreamEaiCrawlStage
 from tutorials.eai_crawl.s3_url_generation import S3WarcUrlGenerator
 
 
@@ -40,6 +45,12 @@ class _FakeS3Client:
         return _FakePaginator(self._keys)
 
 
+class _NoListS3Client:
+    def get_paginator(self, _name: str) -> _FakePaginator:
+        msg = "key-file mode must not list S3"
+        raise AssertionError(msg)
+
+
 class TestS3WarcUrlGenerator:
     def test_lists_and_filters_warc_keys(self) -> None:
         client = _FakeS3Client(
@@ -56,6 +67,57 @@ class TestS3WarcUrlGenerator:
         generator = S3WarcUrlGenerator(bucket="bkt", limit=2, client=client)
 
         assert generator.generate_urls() == ["a.warc", "b.warc"]
+
+    def test_exact_key_file_bypasses_s3_listing(self, tmp_path: Path) -> None:
+        key_file = tmp_path / "group_00000.txt"
+        key_file.write_text("crawl/b.warc.gz\ncrawl/a.warc.gz\n", encoding="utf-8")
+        generator = S3WarcUrlGenerator(
+            bucket="bkt",
+            prefix="crawl/",
+            suffix=".warc.gz",
+            client=_NoListS3Client(),
+            key_file=str(key_file),
+        )
+
+        assert generator.generate_urls() == ["crawl/b.warc.gz", "crawl/a.warc.gz"]
+
+    @pytest.mark.parametrize(
+        ("contents", "error"),
+        [
+            ("", "empty"),
+            ("crawl/a.warc.gz\n\ncrawl/b.warc.gz\n", "blank"),
+            ("crawl/a.warc.gz\ncrawl/a.warc.gz\n", "Duplicate"),
+            ("other/a.warc.gz\n", "escapes prefix"),
+            ("crawl/a.txt\n", "does not end"),
+        ],
+    )
+    def test_exact_key_file_rejects_invalid_membership(self, tmp_path: Path, contents: str, error: str) -> None:
+        key_file = tmp_path / "group_00000.txt"
+        key_file.write_text(contents, encoding="utf-8")
+        generator = S3WarcUrlGenerator(
+            bucket="bkt",
+            prefix="crawl/",
+            suffix=".warc.gz",
+            client=_NoListS3Client(),
+            key_file=str(key_file),
+        )
+
+        with pytest.raises(ValueError, match=error):
+            generator.generate_urls()
+
+    def test_exact_key_file_rejects_limit(self, tmp_path: Path) -> None:
+        key_file = tmp_path / "group_00000.txt"
+        key_file.write_text("crawl/a.warc.gz\n", encoding="utf-8")
+        generator = S3WarcUrlGenerator(
+            bucket="bkt",
+            prefix="crawl/",
+            suffix=".warc.gz",
+            limit=1,
+            key_file=str(key_file),
+        )
+
+        with pytest.raises(ValueError, match="cannot be combined"):
+            generator.generate_urls()
 
 
 class TestS3WarcMetadataStage:
@@ -103,3 +165,14 @@ class TestS3EaiCrawlStage:
         assert len(stages) == 2
         assert isinstance(stages[1], S3WarcMetadataStage)
         assert stage.name == "s3_eai_crawl_pdf_extract"
+
+
+class TestS3StreamEaiCrawlStage:
+    def test_decomposition_passes_exact_key_file(self) -> None:
+        stage = S3StreamEaiCrawlStage(
+            bucket="bkt",
+            prefix="crawl/",
+            key_file="/shared/worklists/group_00007.txt",
+        )
+
+        assert stage.url_generator.key_file == "/shared/worklists/group_00007.txt"

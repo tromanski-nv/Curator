@@ -245,6 +245,7 @@ class S3StreamEaiCrawlStage(CompositeStage[EmptyTask, DocumentBatch]):
         cdx_output_dir: str | None = None,
         cdx_storage_options: dict[str, Any] | None = None,
         add_filename_column: bool | str = False,
+        key_file: str | None = None,
     ) -> None:
         super().__init__()
         self.url_generator = S3WarcUrlGenerator(
@@ -254,6 +255,7 @@ class S3StreamEaiCrawlStage(CompositeStage[EmptyTask, DocumentBatch]):
             limit=url_limit,
             endpoint_url=endpoint_url,
             region=region,
+            key_file=key_file,
         )
         self.stages = [
             URLGenerationStage(url_generator=self.url_generator, limit=url_limit),

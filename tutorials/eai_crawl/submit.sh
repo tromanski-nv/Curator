@@ -24,7 +24,7 @@
 #   AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
 #       sbatch --nodes=2 --time=04:00:00 tutorials/eai_crawl/submit.sh
 #
-# Tip: one job per day-prefix. One Ray task = one WARC.
+# Tip: run_day_array.sh passes one exact WARC group to each one-node array task.
 # =============================================================================
 
 #SBATCH --job-name=eai-warc-pdf
@@ -59,7 +59,9 @@ fi
 
 # Shared dir for Ray port broadcast — must be visible to ALL nodes.
 export RAY_PORT_BROADCAST_DIR="${CURATOR_DIR}/logs"
-export RAY_TMPDIR="/tmp/ray_${SLURM_JOB_ID}"
+ray_job_id="${SLURM_ARRAY_JOB_ID:-${SLURM_JOB_ID}}"
+ray_task_id="${SLURM_ARRAY_TASK_ID:-single}"
+export RAY_TMPDIR="/tmp/ray_${ray_job_id}_${ray_task_id}"
 # Do NOT use `uv run` under Ray — workers relaunch with a bare `uv run` that can
 # rebuild an empty .venv (ModuleNotFoundError: ray). Activate the synced venv instead.
 
@@ -72,6 +74,42 @@ EAI_STREAM="${EAI_STREAM:-}"
 EAI_URL_LIMIT="${EAI_URL_LIMIT:-}"
 EAI_CDX_OUTPUT_DIR="${EAI_CDX_OUTPUT_DIR:-}"
 EAI_OUTPUT_RCLONE_REMOTE="${EAI_OUTPUT_RCLONE_REMOTE:-}"
+EAI_WARC_KEY_DIR="${EAI_WARC_KEY_DIR:-}"
+EAI_S3_KEY_FILE=""
+ARRAY_GROUP=""
+
+# Array mode: resolve one exact shared-FS worklist and isolate overwrite-mode
+# outputs. Without separate roots, concurrent ParquetWriter instances can
+# recursively delete one another's day-level output.
+if [[ -n "$EAI_WARC_KEY_DIR" ]]; then
+    : "${SLURM_ARRAY_TASK_ID:?EAI_WARC_KEY_DIR requires a Slurm array task}"
+    if [[ -z "$EAI_S3_BUCKET" || -z "$EAI_STREAM" || -n "$EAI_WARC_DIR" ]]; then
+        echo "ERROR: WARC array worklists require S3 streaming (set EAI_S3_BUCKET and EAI_STREAM only)" >&2
+        exit 1
+    fi
+    if [[ -n "$EAI_URL_LIMIT" ]]; then
+        echo "ERROR: EAI_URL_LIMIT cannot be combined with an exact array worklist" >&2
+        exit 1
+    fi
+    if [[ "${SLURM_JOB_NUM_NODES:-1}" -ne 1 ]]; then
+        echo "ERROR: WARC array elements must allocate exactly one node" >&2
+        exit 1
+    fi
+    if [[ "$EAI_WARC_KEY_DIR" != /* ]]; then
+        echo "ERROR: EAI_WARC_KEY_DIR must be an absolute shared-filesystem path" >&2
+        exit 1
+    fi
+    ARRAY_GROUP="$(printf '%05d' "$SLURM_ARRAY_TASK_ID")"
+    EAI_S3_KEY_FILE="${EAI_WARC_KEY_DIR}/group_${ARRAY_GROUP}.txt"
+    if [[ ! -s "$EAI_S3_KEY_FILE" ]]; then
+        echo "ERROR: missing or empty array worklist: ${EAI_S3_KEY_FILE}" >&2
+        exit 1
+    fi
+    EAI_OUTPUT_DIR="${EAI_OUTPUT_DIR%/}/warc_group=${ARRAY_GROUP}/"
+    if [[ -n "$EAI_CDX_OUTPUT_DIR" ]]; then
+        EAI_CDX_OUTPUT_DIR="${EAI_CDX_OUTPUT_DIR%/}/warc_group=${ARRAY_GROUP}/"
+    fi
+fi
 
 # Build source-specific args.
 if [[ -n "${EAI_S3_BUCKET}" ]]; then
@@ -79,12 +117,24 @@ if [[ -n "${EAI_S3_BUCKET}" ]]; then
     [[ -n "${EAI_S3_ENDPOINT_URL}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --s3-endpoint-url ${EAI_S3_ENDPOINT_URL}"
     # Streaming is required for compressed .warc.gz (e.g. the EAI crawl).
     [[ -n "${EAI_STREAM}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --stream"
+    [[ -n "${EAI_S3_KEY_FILE}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --s3-key-file '${EAI_S3_KEY_FILE}'"
 elif [[ -n "${EAI_WARC_DIR}" ]]; then
     SOURCE_ARGS="--warc-dir ${EAI_WARC_DIR}"
 else
     echo "ERROR: set either EAI_WARC_DIR or EAI_S3_BUCKET" >&2
     exit 1
 fi
+
+# One-node allocations use one local RayClient. Only multi-node allocations
+# need SlurmRayClient and one driver process per node.
+RAY_CLIENT_ARGS=""
+if [[ "${SLURM_JOB_NUM_NODES:-1}" -gt 1 ]]; then
+    RAY_CLIENT_ARGS="--slurm"
+else
+    : "${SLURM_CPUS_PER_TASK:?one-node RayClient requires SLURM_CPUS_PER_TASK}"
+    RAY_CLIENT_ARGS="--ray-num-cpus ${SLURM_CPUS_PER_TASK}"
+fi
+unset RAY_ADDRESS
 [[ -n "${EAI_URL_LIMIT}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --url-limit ${EAI_URL_LIMIT}"
 [[ -n "${EAI_CDX_OUTPUT_DIR}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --cdx-output-dir ${EAI_CDX_OUTPUT_DIR}"
 [[ -n "${EAI_OUTPUT_RCLONE_REMOTE}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --output-rclone-remote ${EAI_OUTPUT_RCLONE_REMOTE}"
@@ -106,6 +156,7 @@ echo "  Nodes  : ${SLURM_JOB_NODELIST} (${SLURM_JOB_NUM_NODES} nodes)"
 echo "  Dir    : ${CURATOR_DIR}"
 echo "  Venv   : ${VENV_PATH}"
 echo "  Source : ${SOURCE_ARGS}"
+echo "  Group  : ${ARRAY_GROUP:-"(not an array)"}"
 echo "  Output : ${EAI_OUTPUT_DIR}"
 echo "  CDX    : ${EAI_CDX_OUTPUT_DIR:-"(disabled)"}"
 echo "=================================================="
@@ -124,7 +175,9 @@ srun \
     bash -c "
 cd '${CURATOR_DIR}'
 source '${VENV_PATH}/bin/activate'
-export RAY_TMPDIR=/tmp/ray_\${SLURM_JOB_ID}
+unset RAY_ADDRESS
+export CUDA_VISIBLE_DEVICES=''
+export RAY_TMPDIR='${RAY_TMPDIR}'
 export RAY_PORT_BROADCAST_DIR='${CURATOR_DIR}/logs'
 # Read creds (team-vendor-data) for WARC streaming.
 export AWS_ACCESS_KEY_ID='${AWS_ACCESS_KEY_ID:-}'
@@ -140,7 +193,7 @@ export EAI_OUT_AWS_ENDPOINT_URL='${EAI_OUT_AWS_ENDPOINT_URL:-${EAI_S3_ENDPOINT_U
 export EAI_OUT_AWS_DEFAULT_REGION='${EAI_OUT_AWS_DEFAULT_REGION:-${AWS_DEFAULT_REGION:-}}'
 echo \"[\$(hostname)] SLURM_NODEID=\${SLURM_NODEID} python=\$(python --version 2>&1) which=\$(which python)\"
 python '${CURATOR_DIR}/tutorials/eai_crawl/run_slurm.py' \
-    --slurm \
+    ${RAY_CLIENT_ARGS} \
     ${SOURCE_ARGS} \
     --output-dir '${EAI_OUTPUT_DIR}'
 "

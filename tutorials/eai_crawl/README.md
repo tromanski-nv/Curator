@@ -119,11 +119,12 @@ independent / resumable:
 
 | Path | Contents |
 |------|----------|
-| `s3://eai-warcs/pdf_url_idx/crawl_date=YYYYMMDD/*.parquet` | PDF URLs + offsets |
-| `s3://eai-warcs/cdx/crawl_date=YYYYMMDD/<uuid>.parquet` | Full response CDX per WARC |
+| `s3://eai-warcs/pdf_url_idx/crawl_date=YYYYMMDD/warc_group=NNNNN/*.parquet` | PDF URLs + offsets |
+| `s3://eai-warcs/cdx/crawl_date=YYYYMMDD/warc_group=NNNNN/<uuid>.parquet` | Full response CDX per WARC |
 
 - **Stress-test one day:** write only `crawl_date=20240814/`.
-- **Full crawl later:** one SLURM job (or array task) per day → same root, new partition.
+- **Full crawl later:** one Slurm array per selected day; every element owns one
+  `warc_group` subtree, so overwrite mode cannot delete a sibling's output.
 - **Do not** dump all days into a flat `pdf_url_idx/` with no partition — harder to
   resume, reprocess, or delete a bad day. Readers (DuckDB/Spark/pandas) can still
   scan the whole tree as one dataset.
@@ -133,8 +134,10 @@ easy to delete without touching real day partitions.
 
 ### Day-scale checklist (you run these)
 
-**Unit of work:** one day-prefix (`eai-warc/20240814/`) = one job. Inside the job,
-listing fans out to **one Ray task per WARC** (~88 objects that day).
+**Admission unit:** one day-prefix (`eai-warc/20240814/`) = one Slurm array.
+The login-side launcher lists that day once and splits it into fixed-count key
+files. Each array element receives one exact group; inside it, Curator fans out
+to **one Ray task per WARC**.
 
 Write remote: rclone ``eai-data`` (separate creds from the WARC read remote).
 
@@ -193,27 +196,31 @@ rm -rf /lustre/fsw/portfolios/nemotron/users/tromanski/eai_out \
        /tmp/eai_cdx_probe /tmp/eai_pdf_fetch /tmp/eai_pdf_verify /tmp/eai_pdf_idx_smoke /tmp/eai_pdf_20240814
 ```
 
-**3. Full day on SLURM (Ray; dedicated nodes — avoids login-node port fights):**
+**3. Full day as a one-node-per-group Slurm array:**
 
-Do **not** use `uv run` under Ray — activate `.venv` (``submit.sh`` already does).
+Do **not** use `uv run` under Ray — `submit.sh` activates `.venv`. Preview the
+exact worklists and `sbatch` command before submitting:
 
-```fish
-# fish (login)
-mkdir -p logs
-set -x EAI_S3_BUCKET vdi-169-essentialai-essentialai-data
-set -x EAI_S3_PREFIX eai-warc/20240814/
-set -x EAI_S3_ENDPOINT_URL https://pdx.s8k.io
-set -x EAI_STREAM 1
-set -x EAI_OUTPUT_DIR s3://eai-warcs/pdf_url_idx/crawl_date=20240814/
-set -x EAI_CDX_OUTPUT_DIR s3://eai-warcs/cdx/crawl_date=20240814/
-set -x EAI_OUTPUT_RCLONE_REMOTE eai-data
-# reuse AWS_* (read) from step 2
+```bash
+# login node; reuse the source AWS_* credentials from step 2
+DRY_RUN=1 WARCS_PER_ARRAY_TASK=720 \
+  bash tutorials/eai_crawl/run_day_array.sh 20240814
 
-sbatch --nodes=2 --cpus-per-task=16 --time=04:00:00 tutorials/eai_crawl/submit.sh
+# Reuse the exact worklist path printed by the dry run; this does not re-list.
+EXISTING_WORKLIST_DIR="$(pwd)/logs/eai_array_worklists/20240814.active" \
+  bash tutorials/eai_crawl/run_day_array.sh 20240814
 ```
 
-Watch: `tail -f logs/eai_warc_<jobid>.log`. Later days: change `20240814` in
-`EAI_S3_PREFIX` + both output paths and resubmit (or use a SLURM array over days).
+The default derives 720 WARCs from an initial estimate of 240 WARCs/hour for a
+three-hour target, with a four-hour Slurm ceiling. This is not yet a remote
+throughput measurement. Calibrate the next group size from a representative
+one-node result (`new_count = old_count * 3h / elapsed`) before widening the
+array. Submit only one day/campaign at a time unless the sum of array throttles
+still respects the workflow-wide node cap. The `.active` worklist directory is
+also the campaign claim and is retained as a receipt; do not remove it until
+the submitted array has stopped.
+
+Watch: `tail -f logs/eai_20240814_<array-job>_<task>.log`.
 
 **4. After the day finishes — URL handoff:**
 
