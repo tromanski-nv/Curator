@@ -203,12 +203,8 @@ def iterate_cdx_and_pdfs(
         result.num_records += 1
         rec_type = record.rec_type or ""
 
-        # Always drain the record so offset/length are accurate.
-        try:
-            _ = record.content_stream().read()
-        except Exception:
-            logger.exception(f"Error draining record {result.num_records} in {warc_filename}")
-
+        # These accessors drain the current record in bounded chunks before
+        # reporting its compressed member boundaries.
         offset = archive.get_record_offset()
         length = archive.get_record_length()
 

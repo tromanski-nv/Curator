@@ -14,6 +14,7 @@
 
 import gzip
 import io
+from unittest.mock import patch
 
 from tests.tutorials.eai_crawl.test_s3_download import _make_record
 from tutorials.eai_crawl.cdx_index import iterate_cdx_and_pdfs
@@ -71,8 +72,10 @@ class TestIterateCdxAndPdfs:
 
     def test_per_record_gzip_layout_detected(self) -> None:
         warc = _per_record_gzip(_two_record_warc())
-        result = iterate_cdx_and_pdfs(io.BytesIO(warc), warc_filename="sample.warc.gz", detect_layout=True)
+        with patch("warcio.recordloader.ArcWarcRecord.content_stream", autospec=True) as content_stream:
+            result = iterate_cdx_and_pdfs(io.BytesIO(warc), warc_filename="sample.warc.gz", detect_layout=True)
 
+        content_stream.assert_not_called()
         assert result.gzip_layout == "per_record"
         assert len(result.cdx_rows) == 2
         assert len(result.pdf_rows) == 1
