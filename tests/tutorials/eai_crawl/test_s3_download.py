@@ -107,7 +107,8 @@ class TestUncompressedSequentialScan:
 
         assert len(rows) == 2
         assert rows[0]["filename"] == "doc0.pdf"
-        assert rows[0]["id"] == "pdf0"
+        assert rows[0]["warc_id"] == "pdf0"
+        assert "id" not in rows[0]
         assert "content" not in rows[0]
 
 

@@ -54,7 +54,14 @@ class S3WarcUrlGenerator(URLGenerator):
             msg = "boto3 is required for S3WarcUrlGenerator. Install with: pip install boto3"
             raise RuntimeError(msg) from exc
         endpoint = self.endpoint_url or os.environ.get("AWS_ENDPOINT_URL") or None
-        return boto3.client("s3", endpoint_url=endpoint, region_name=self.region)
+        from botocore.config import Config as BotoConfig
+
+        return boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            region_name=self.region,
+            config=BotoConfig(s3={"addressing_style": "path"}, signature_version="s3v4"),
+        )
 
     def generate_urls(self) -> list[str]:
         client = self._get_client()

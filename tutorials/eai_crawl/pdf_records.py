@@ -32,11 +32,14 @@ PDF_RECORD_COLUMNS = [
     "warc_date",
 ]
 
+# PDF Parquet schema. Deliberately omits:
+#   - ``id`` (was a duplicate of ``warc_id``)
+#   - ``source_id`` (was a duplicate of ``file_name`` / basename of ``warc_filename``)
+# ``filename`` is the URL-path basename (e.g. Medicion4.pdf); ``file_name`` is
+# added by the streaming stage as the WARC object basename — different fields.
 PDF_OUTPUT_COLUMNS = [
     "url",
-    "id",
     "warc_id",
-    "source_id",
     "content_type",
     "content_length",
     "http_status",
@@ -128,9 +131,7 @@ def extract_pdf_record(record: dict[str, Any]) -> dict[str, Any] | None:
 
     return {
         "url": url,
-        "id": record["warc_id"],
         "warc_id": record["warc_id"],
-        "source_id": record["source_id"],
         "content_type": record.get("content_type", PDF_CONTENT_TYPE),
         "content_length": record.get("content_length"),
         "http_status": record.get("http_status"),

@@ -72,10 +72,27 @@ class TestS3WarcStreamStage:
         assert len(df) == 1
         row = df.iloc[0]
         assert row["url"] == "http://example.com/a.pdf"
-        assert row["id"] == "pdf1"
+        assert row["warc_id"] == "pdf1"
         assert row["filename"] == "a.pdf"
-        assert row["file_name"] == "sample.warc"
+        assert row["warc_filename"] == "eai-warc/20240814/sample.warc"
+        assert "id" not in df.columns
+        assert "source_id" not in df.columns
+        assert "content_type" not in df.columns
+        assert "file_name" not in df.columns
+        assert "warc_record_offset" in df.columns
+        assert "warc_record_length" in df.columns
         assert "content" not in df.columns
+
+    def test_writes_cdx_parquet_when_configured(self, tmp_path) -> None:
+        stage = S3WarcStreamStage(streamer=_BytesStreamer(_two_record_warc()), cdx_output_dir=str(tmp_path))
+        task = FileGroupTask(dataset_name="eai", data=["eai-warc/20240814/sample.warc"], _metadata={})
+        stage.process(task)
+
+        cdx_files = list(tmp_path.glob("*.parquet"))
+        assert len(cdx_files) == 1
+        cdx = __import__("pandas").read_parquet(cdx_files[0])
+        assert len(cdx) == 2  # html + pdf responses
+        assert set(cdx["is_pdf"].tolist()) == {False, True}
 
     def test_process_per_record_gzip_stream(self) -> None:
         # Standard .warc.gz layout: each record is an independent gzip member.
@@ -103,7 +120,10 @@ class TestS3WarcStreamStage:
         df = stage.process(task).to_pandas()
 
         assert list(df["url"]) == ["http://example.com/a.pdf", "http://example.com/b.pdf"]
-        assert list(df["file_name"]) == ["sample.warc.gz", "sample.warc.gz"]
+        assert list(df["warc_filename"]) == [
+            "eai-warc/20240814/sample.warc.gz",
+            "eai-warc/20240814/sample.warc.gz",
+        ]
 
     def test_record_limit(self) -> None:
         records = [
@@ -162,7 +182,8 @@ class _FakeBoto3Module(types.ModuleType):
         self.calls: list[dict] = []
 
     def client(self, service: str, **kwargs: object) -> str:  # noqa: ARG002
-        self.calls.append(kwargs)
+        # Drop Config object for easier assertions; keep endpoint/region.
+        self.calls.append({k: v for k, v in kwargs.items() if k != "config"})
         return "fake-client"
 
 

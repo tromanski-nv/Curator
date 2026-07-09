@@ -16,10 +16,12 @@
 
 Unlike ``s3_stage.S3WarcMetadataStage`` (which range-reads only header bytes and
 therefore requires *uncompressed* WARCs), this stage streams each ``.warc.gz``
-object through ``warcio`` and extracts PDF URL/metadata on the fly. The PDF
-*bodies* are decompressed and discarded in-flight, so nothing is written to disk,
-but the whole object must be read over the network (unavoidable for whole-file
-gzip without a byte-offset/CDX index).
+object through ``warcio`` and extracts PDF URL/metadata on the fly. Optionally
+also writes a per-WARC CDX-style index (``offset`` / ``length``) for later O(1)
+range-fetch of filtered records.
+
+``URLGenerationStage`` already emits **one ``FileGroupTask`` per WARC object**,
+so each Ray worker processes a single shard — the right unit for day-scale jobs.
 
 This is the correct path for the EssentialAI crawl layout:
 ``s3://<bucket>/eai-warc/<YYYYMMDD>/<uuid>.warc.gz``.
@@ -27,12 +29,14 @@ This is the correct path for the EssentialAI crawl layout:
 For S3-compatible stores (SwiftStack), set ``endpoint_url`` (or the
 ``AWS_ENDPOINT_URL`` env var); credentials come from the boto3 default chain
 (``AWS_ACCESS_KEY_ID`` / ``AWS_SECRET_ACCESS_KEY`` / ``AWS_SESSION_TOKEN``).
+Path-style addressing is used (required by many S3-compatible endpoints).
 """
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import IO, Any
 
 import pandas as pd
@@ -42,8 +46,26 @@ from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.download.base.url_generation import URLGenerationStage
 from nemo_curator.tasks import DocumentBatch, EmptyTask, FileGroupTask
-from tutorials.eai_crawl.pdf_records import PDF_OUTPUT_COLUMNS, extract_pdf_record, iterate_pdf_warc_stream
+from tutorials.eai_crawl.cdx_index import CDX_COLUMNS, iterate_cdx_and_pdfs
+from tutorials.eai_crawl.s3_storage import ensure_parent, is_remote_url, write_parquet
 from tutorials.eai_crawl.s3_url_generation import S3WarcUrlGenerator
+
+# Trimmed PDF-URL output schema. Dropped vs. the raw record: ``id`` (identical to
+# ``warc_id``), ``source_id``/``file_name`` (both just the basename of
+# ``warc_filename``), and ``content_type`` (always ``application/pdf`` here).
+# ``filename`` is kept for convenience; ``warc_filename`` + offset + length are the
+# coords needed to range-fetch the PDF later.
+PDF_INDEX_COLUMNS = [
+    "url",
+    "warc_id",
+    "content_length",
+    "http_status",
+    "warc_date",
+    "filename",
+    "warc_filename",
+    "warc_record_offset",
+    "warc_record_length",
+]
 
 
 class ObjectStreamer:
@@ -61,7 +83,7 @@ class S3ObjectStreamer(ObjectStreamer):
     ``https://pdx.s8k.io``).
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         bucket: str,
         *,
@@ -88,6 +110,8 @@ class S3ObjectStreamer(ObjectStreamer):
             from botocore.config import Config as BotoConfig
 
             boto_cfg = BotoConfig(
+                s3={"addressing_style": "path"},
+                signature_version="s3v4",
                 retries={"max_attempts": self.max_retries, "mode": "adaptive"},
                 connect_timeout=self.timeout,
                 read_timeout=self.timeout,
@@ -104,13 +128,20 @@ class S3ObjectStreamer(ObjectStreamer):
 
 @dataclass
 class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
-    """Stream ``.warc.gz`` objects and emit a DocumentBatch of PDF URLs/metadata."""
+    """Stream ``.warc.gz`` objects; emit PDF URL rows (with CDX offsets).
+
+    When ``cdx_output_dir`` is set, also writes one Parquet file per WARC under
+    that directory with all response-record index rows (CDX-style).
+    """
 
     bucket: str | None = None
     endpoint_url: str | None = None
     region: str | None = None
     record_limit: int | None = None
-    add_filename_column: bool | str = True
+    cdx_output_dir: str | None = None
+    cdx_storage_options: dict[str, Any] | None = None
+    # file_name is redundant with warc_filename's basename; off by default.
+    add_filename_column: bool | str = False
     streamer: ObjectStreamer | None = None  # inject for tests; else S3ObjectStreamer(bucket)
     name: str = "s3_warc_pdf_stream"
     resources = Resources(cpus=1.0)
@@ -118,12 +149,14 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
     def __post_init__(self) -> None:
         self.filename_col = self.add_filename_column if isinstance(self.add_filename_column, str) else "file_name"
         self._s3_streamer: ObjectStreamer | None = None
+        if self.cdx_output_dir and not is_remote_url(self.cdx_output_dir):
+            ensure_parent(self.cdx_output_dir)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return (["data"], [])
 
     def outputs(self) -> tuple[list[str], list[str]]:
-        cols = list(PDF_OUTPUT_COLUMNS)
+        cols = list(PDF_INDEX_COLUMNS)
         if self.add_filename_column:
             cols.append(self.filename_col)
         return (["data"], cols)
@@ -140,29 +173,48 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
             )
         return self._s3_streamer
 
+    def _write_cdx(self, key: str, cdx_rows: list[dict[str, Any]]) -> None:
+        if not self.cdx_output_dir:
+            return
+        stem = Path(key).name.replace(".warc.gz", "").replace(".warc", "")
+        if is_remote_url(self.cdx_output_dir):
+            out = self.cdx_output_dir.rstrip("/") + f"/{stem}.parquet"
+        else:
+            out = str(Path(self.cdx_output_dir) / f"{stem}.parquet")
+        write_parquet(
+            pd.DataFrame(cdx_rows, columns=CDX_COLUMNS),
+            out,
+            storage_options=self.cdx_storage_options,
+        )
+        logger.info(f"Wrote {len(cdx_rows)} CDX row(s) -> {out}")
+
     def process(self, task: FileGroupTask) -> DocumentBatch:
         streamer = self._get_streamer()
         rows: list[dict[str, Any]] = []
 
         for key in task.data:
-            count = 0
             try:
                 stream = streamer.open(key)
                 try:
-                    for raw_record in iterate_pdf_warc_stream(stream, source_name=os.path.basename(key)):
-                        extracted = extract_pdf_record(raw_record)
-                        if extracted is None:
-                            continue
-                        if self.add_filename_column:
-                            extracted[self.filename_col] = os.path.basename(key)
-                        rows.append(extracted)
-                        count += 1
-                        if self.record_limit and count >= self.record_limit:
-                            break
+                    result = iterate_cdx_and_pdfs(
+                        stream,
+                        warc_filename=key,
+                        pdf_record_limit=self.record_limit,
+                    )
                 finally:
                     close = getattr(stream, "close", None)
                     if callable(close):
                         close()
+
+                self._write_cdx(key, result.cdx_rows)
+                logger.info(
+                    f"{key}: layout={result.gzip_layout} responses={result.num_responses} "
+                    f"pdfs={len(result.pdf_rows)} cdx={len(result.cdx_rows)}"
+                )
+                for extracted in result.pdf_rows:
+                    if self.add_filename_column:
+                        extracted[self.filename_col] = os.path.basename(key)
+                    rows.append(extracted)
             except Exception:  # noqa: BLE001
                 logger.exception(f"Failed streaming WARC object {key}")
                 continue
@@ -170,13 +222,16 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
         return DocumentBatch(
             dataset_name=task.dataset_name,
             data=pd.DataFrame(rows, columns=self.outputs()[1]),
-            _metadata={**task._metadata},
+            _metadata={**task._metadata, "source_files": list(task.data)},
             _stage_perf=task._stage_perf,
         )
 
 
 class S3StreamEaiCrawlStage(CompositeStage[EmptyTask, DocumentBatch]):
-    """List S3/SwiftStack WARC objects and collect PDF URLs by streaming each object."""
+    """List S3/SwiftStack WARC objects and collect PDF URLs by streaming each object.
+
+    Fan-out is one Ray task per WARC (via ``URLGenerationStage``).
+    """
 
     def __init__(  # noqa: PLR0913
         self,
@@ -187,7 +242,9 @@ class S3StreamEaiCrawlStage(CompositeStage[EmptyTask, DocumentBatch]):
         region: str | None = None,
         url_limit: int | None = None,
         record_limit: int | None = None,
-        add_filename_column: bool | str = True,
+        cdx_output_dir: str | None = None,
+        cdx_storage_options: dict[str, Any] | None = None,
+        add_filename_column: bool | str = False,
     ) -> None:
         super().__init__()
         self.url_generator = S3WarcUrlGenerator(
@@ -205,6 +262,8 @@ class S3StreamEaiCrawlStage(CompositeStage[EmptyTask, DocumentBatch]):
                 endpoint_url=endpoint_url,
                 region=region,
                 record_limit=record_limit,
+                cdx_output_dir=cdx_output_dir,
+                cdx_storage_options=cdx_storage_options,
                 add_filename_column=add_filename_column,
             ),
         ]
@@ -214,4 +273,7 @@ class S3StreamEaiCrawlStage(CompositeStage[EmptyTask, DocumentBatch]):
         return self.stages
 
     def get_description(self) -> str:
-        return "Collect PDF URLs/metadata by streaming application/pdf records from S3/SwiftStack .warc.gz objects"
+        return (
+            "Collect PDF URLs (+ optional per-WARC CDX index) by streaming "
+            "application/pdf records from S3/SwiftStack .warc.gz objects"
+        )

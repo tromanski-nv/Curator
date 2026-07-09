@@ -88,9 +88,10 @@ class TestS3WarcMetadataStage:
         assert len(df) == 1
         row = df.iloc[0]
         assert row["url"] == "http://example.com/a.pdf"
-        assert row["id"] == "pdf1"
+        assert row["warc_id"] == "pdf1"
         assert row["filename"] == "a.pdf"
         assert row["file_name"] == "sample.warc"
+        assert "id" not in df.columns
         assert "content" not in df.columns
 
 

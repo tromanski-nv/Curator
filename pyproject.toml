@@ -293,10 +293,19 @@ build = ["setuptools", "torch<=2.10.0", "Cython", "packaging"]
 dev = ["jupyter"]
 eai-warcs = [
     "boto3>=1.41.5",
+    "brotlicffi>=1.2.0.1",
     "pandas>=2.3.3",
+    "pyarrow",
+    "s3fs>=2024.12.0",
     "warcio>=1.7.5",
 ]
 linting = ["pre-commit", "ruff==0.14.10"]
+quality-classification = [
+    "nvidia-ml-py",  # pynvml: cosmos-xenna GPU detection (else it sees 0 GPUs)
+    "pandas>=2.3.3",
+    "pyarrow",
+    "vllm>=0.14.1; (platform_machine == 'x86_64' and platform_system != 'Darwin')",
+]
 test = [
     "coverage",
     "debugpy",

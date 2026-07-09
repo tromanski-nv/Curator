@@ -107,9 +107,11 @@ class TestEaiPdfExtractor:
 
         assert result is not None
         assert result["url"] == "http://example.com/doc.pdf"
-        assert result["id"] == "pdf123"
+        assert result["warc_id"] == "pdf123"
         assert result["filename"] == "doc.pdf"
         assert result["content_length"] == 12345
+        assert "id" not in result
+        assert "source_id" not in result
         assert "content" not in result
         assert "text" not in result
 
