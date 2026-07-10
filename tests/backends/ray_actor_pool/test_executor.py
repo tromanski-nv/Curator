@@ -16,7 +16,8 @@ from unittest import mock
 
 import pytest
 
-from nemo_curator.backends.ray_actor_pool.executor import _parse_runtime_env
+from nemo_curator.backends.ray_actor_pool import executor as executor_mod
+from nemo_curator.backends.ray_actor_pool.executor import RayActorPoolExecutor, _parse_runtime_env
 from nemo_curator.backends.ray_actor_pool.utils import calculate_optimal_actors_for_stage
 from nemo_curator.stages.resources import Resources
 
@@ -35,6 +36,65 @@ class TestRayActorPoolExecutor:
             "env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": ""},
             "some_other_key": "some_other_value",
         }
+
+    def test_cleanup_actors_dispatches_teardowns_concurrently(self) -> None:
+        # All teardown.remote() calls must be issued before any ray.get() so that the
+        # actors tear down in parallel instead of one-at-a-time.
+        calls: list[tuple[str, int]] = []
+
+        actors = []
+        for idx in range(3):
+            actor = mock.Mock(name=f"actor-{idx}")
+            actor.teardown.remote.side_effect = lambda i=idx: (calls.append(("remote", i)), f"fut-{i}")[1]
+            actors.append(actor)
+
+        class _FakeRayError(Exception):
+            pass
+
+        with mock.patch.object(executor_mod, "ray") as mock_ray:
+            mock_ray.get.side_effect = lambda fut: calls.append(("get", int(fut.split("-")[1])))
+            mock_ray.kill.side_effect = lambda actor: calls.append(("kill", actors.index(actor)))
+            mock_ray.exceptions.RayActorError = _FakeRayError
+            mock_ray.exceptions.RaySystemError = _FakeRayError
+
+            RayActorPoolExecutor._cleanup_actors(mock.Mock(), actors)
+
+        remotes = [c for c in calls if c[0] == "remote"]
+        first_get_pos = next(pos for pos, c in enumerate(calls) if c[0] == "get")
+        # Every teardown.remote() happened before the first ray.get().
+        assert all(calls.index(r) < first_get_pos for r in remotes)
+        # teardown launched, awaited, and killed for each actor.
+        assert sorted(i for k, i in calls if k == "remote") == [0, 1, 2]
+        assert sorted(i for k, i in calls if k == "get") == [0, 1, 2]
+        assert sorted(i for k, i in calls if k == "kill") == [0, 1, 2]
+
+    def test_cleanup_actors_isolates_teardown_errors(self) -> None:
+        # A failing teardown on one actor must not prevent the others from cleaning up.
+        actors = [mock.Mock(name=f"actor-{idx}") for idx in range(3)]
+        for idx, actor in enumerate(actors):
+            actor.teardown.remote.return_value = f"fut-{idx}"
+
+        class _FakeRayError(Exception):
+            pass
+
+        killed: list[int] = []
+
+        def _get(fut: str) -> None:
+            if fut == "fut-1":
+                raise _FakeRayError("boom")
+
+        with mock.patch.object(executor_mod, "ray") as mock_ray:
+            mock_ray.get.side_effect = _get
+            mock_ray.kill.side_effect = lambda actor: killed.append(actors.index(actor))
+            mock_ray.exceptions.RayActorError = _FakeRayError
+            mock_ray.exceptions.RaySystemError = _FakeRayError
+
+            with mock.patch.object(executor_mod, "logger") as mock_logger:
+                RayActorPoolExecutor._cleanup_actors(mock.Mock(), actors)
+                mock_logger.warning.assert_called_once()
+
+        # Actor 1 failed its teardown (so it is not killed), but 0 and 2 still are.
+        assert killed == [0, 2]
 
     @pytest.mark.parametrize(
         ("available_cpus", "expected_actors", "expected_warning"),

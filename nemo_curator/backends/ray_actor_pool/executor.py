@@ -366,10 +366,18 @@ class RayActorPoolExecutor(BaseExecutor):
         return all_results
 
     def _cleanup_actors(self, actors: list[ray.actor.ActorHandle]) -> None:
-        """Clean up a list of actors."""
-        for i, actor in enumerate(actors):
+        """Clean up a list of actors.
+
+        Each actor's teardown() is independent (it only flushes that actor's own
+        buffers/state), so we launch every teardown first and then collect. This
+        turns an O(num_actors) serial tail into ~O(slowest teardown) -- important
+        for pools with many actors whose teardown does I/O (e.g. flushing buffered
+        output parts to remote storage).
+        """
+        teardown_futures = [actor.teardown.remote() for actor in actors]
+        for i, (actor, future) in enumerate(zip(actors, teardown_futures)):
             try:
-                ray.get(actor.teardown.remote())
+                ray.get(future)
                 ray.kill(actor)
             except (ray.exceptions.RayActorError, ray.exceptions.RaySystemError) as e:
                 logger.warning(f"      Warning: Error cleaning up actor {i}: {e}")
