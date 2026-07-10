@@ -35,6 +35,7 @@ Path-style addressing is used (required by many S3-compatible endpoints).
 from __future__ import annotations
 
 import os
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any
@@ -128,20 +129,52 @@ class S3ObjectStreamer(ObjectStreamer):
 
 @dataclass
 class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
-    """Stream ``.warc.gz`` objects; emit PDF URL rows (with CDX offsets).
+    """Stream ``.warc.gz`` objects; write PDF URL rows and CDX offsets.
 
-    When ``cdx_output_dir`` is set, also writes one Parquet file per WARC under
-    that directory with all response-record index rows (CDX-style).
+    Both outputs are written **per worker** as a side effect: rows are buffered
+    across the many WARCs a worker handles and flushed as consolidated
+    ``part-*.parquet`` files once a buffer reaches its ``*_rows_per_file`` target
+    (with a final flush on ``teardown``). This avoids the millions-of-tiny-files
+    problem of the default one-file-per-task writer — critical here because the
+    fan-out is one Ray task per WARC and most WARCs contain no PDFs (so a per-task
+    writer would emit hundreds of thousands of empty PDF files per chunk).
+
+    When ``pdf_output_dir`` is set the stage is **terminal**: it writes PDF parts
+    itself and returns ``None`` (no ``DocumentBatch`` flows downstream), which
+    keeps the RayActorPool driver's memory bounded regardless of chunk size (the
+    executor otherwise materializes every intermediate task on the head node). If
+    ``pdf_output_dir`` is unset it falls back to returning a ``DocumentBatch`` so
+    the stage stays composable with a downstream writer.
+
+    Buffering across WARCs requires stateful workers + a guaranteed final flush,
+    so this stage overrides ``setup``/``teardown`` (making it an actor stage) and
+    must run on an executor that invokes ``teardown`` (e.g. RayActorPoolExecutor).
     """
 
     bucket: str | None = None
     endpoint_url: str | None = None
     region: str | None = None
     record_limit: int | None = None
+    # PDF index output. When set, PDF rows are buffered + written here per worker
+    # and the stage becomes terminal (returns None). When unset, the stage returns
+    # a DocumentBatch for a downstream writer instead.
+    pdf_output_dir: str | None = None
+    pdf_storage_options: dict[str, Any] | None = None
+    # Consolidated PDF file target, in rows. PDFs are rare, so per-worker buffers
+    # usually flush once at teardown rather than hitting this mid-run.
+    pdf_rows_per_file: int = 2_000_000
     cdx_output_dir: str | None = None
     cdx_storage_options: dict[str, Any] | None = None
+    # Consolidated CDX file size target, in rows. Calibrate to ~250 MiB on disk
+    # from an observed file (rows = target_bytes / (bytes/row)).
+    cdx_rows_per_file: int = 2_000_000
     # file_name is redundant with warc_filename's basename; off by default.
     add_filename_column: bool | str = False
+    # Per-WARC task is I/O-bound (boto3 stream + gzip), not CPU-bound. Lowering the
+    # CPU reservation lets the backend pack more concurrent streams per node (e.g.
+    # cpus=0.25 -> ~4 streams/core) to better saturate the NIC. Default 1.0 keeps
+    # prior behavior.
+    stream_cpus: float = 1.0
     streamer: ObjectStreamer | None = None  # inject for tests; else S3ObjectStreamer(bucket)
     name: str = "s3_warc_pdf_stream"
     resources = Resources(cpus=1.0)
@@ -149,17 +182,31 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
     def __post_init__(self) -> None:
         self.filename_col = self.add_filename_column if isinstance(self.add_filename_column, str) else "file_name"
         self._s3_streamer: ObjectStreamer | None = None
-        if self.cdx_output_dir and not is_remote_url(self.cdx_output_dir):
-            ensure_parent(self.cdx_output_dir)
+        # Instance-level override of the class-default resources (base reads self.resources).
+        self.resources = Resources(cpus=self.stream_cpus)
+        for out_dir in (self.pdf_output_dir, self.cdx_output_dir):
+            if out_dir and not is_remote_url(out_dir):
+                ensure_parent(out_dir)
+
+    def setup(self, worker_metadata: Any = None) -> None:  # noqa: ANN401, ARG002
+        self._init_buffers()
+
+    def teardown(self) -> None:
+        # Flush the final partial buffers (relies on the executor calling teardown).
+        self._flush_pdf(force=True)
+        self._flush_cdx(force=True)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return (["data"], [])
 
     def outputs(self) -> tuple[list[str], list[str]]:
+        return (["data"], self._pdf_columns())
+
+    def _pdf_columns(self) -> list[str]:
         cols = list(PDF_INDEX_COLUMNS)
         if self.add_filename_column:
             cols.append(self.filename_col)
-        return (["data"], cols)
+        return cols
 
     def _get_streamer(self) -> ObjectStreamer:
         if self.streamer is not None:
@@ -173,23 +220,85 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
             )
         return self._s3_streamer
 
-    def _write_cdx(self, key: str, cdx_rows: list[dict[str, Any]]) -> None:
+    def _init_buffers(self) -> None:
+        # Per-worker buffer state (reset seq/tag on each worker).
+        self._pdf_buffer: list[dict[str, Any]] = []
+        self._pdf_buffer_rows = 0
+        self._pdf_flush_seq = 0
+        self._cdx_buffer: list[dict[str, Any]] = []
+        self._cdx_buffer_rows = 0
+        self._cdx_flush_seq = 0
+        self._worker_tag = f"{socket.gethostname()}-{os.getpid()}"
+
+    def _ensure_buffers(self) -> None:
+        # Lazy init so direct process() calls (e.g. in tests) work without setup().
+        if not hasattr(self, "_worker_tag"):
+            self._init_buffers()
+
+    def _part_path(self, out_dir: str, seq: int) -> str:
+        name = f"part-{self._worker_tag}-{seq:05d}.parquet"
+        if is_remote_url(out_dir):
+            return out_dir.rstrip("/") + f"/{name}"
+        return str(Path(out_dir) / name)
+
+    def _buffer_pdf(self, pdf_rows: list[dict[str, Any]]) -> None:
+        if not self.pdf_output_dir or not pdf_rows:
+            return
+        self._ensure_buffers()
+        self._pdf_buffer.extend(pdf_rows)
+        self._pdf_buffer_rows += len(pdf_rows)
+        if self._pdf_buffer_rows >= self.pdf_rows_per_file:
+            self._flush_pdf()
+
+    def _flush_pdf(self, *, force: bool = False) -> None:
+        if not self.pdf_output_dir:
+            return
+        self._ensure_buffers()
+        if not self._pdf_buffer or (not force and self._pdf_buffer_rows < self.pdf_rows_per_file):
+            return
+        out = self._part_path(self.pdf_output_dir, self._pdf_flush_seq)
+        write_parquet(
+            pd.DataFrame(self._pdf_buffer, columns=self._pdf_columns()),
+            out,
+            storage_options=self.pdf_storage_options,
+        )
+        logger.info(f"Flushed {self._pdf_buffer_rows} PDF row(s) -> {out}")
+        self._pdf_flush_seq += 1
+        self._pdf_buffer = []
+        self._pdf_buffer_rows = 0
+
+    def _buffer_cdx(self, cdx_rows: list[dict[str, Any]]) -> None:
+        if not self.cdx_output_dir or not cdx_rows:
+            return
+        self._ensure_buffers()
+        self._cdx_buffer.extend(cdx_rows)
+        self._cdx_buffer_rows += len(cdx_rows)
+        if self._cdx_buffer_rows >= self.cdx_rows_per_file:
+            self._flush_cdx()
+
+    def _flush_cdx(self, *, force: bool = False) -> None:
         if not self.cdx_output_dir:
             return
-        stem = Path(key).name.replace(".warc.gz", "").replace(".warc", "")
-        if is_remote_url(self.cdx_output_dir):
-            out = self.cdx_output_dir.rstrip("/") + f"/{stem}.parquet"
-        else:
-            out = str(Path(self.cdx_output_dir) / f"{stem}.parquet")
+        self._ensure_buffers()
+        if not self._cdx_buffer or (not force and self._cdx_buffer_rows < self.cdx_rows_per_file):
+            return
+        out = self._part_path(self.cdx_output_dir, self._cdx_flush_seq)
         write_parquet(
-            pd.DataFrame(cdx_rows, columns=CDX_COLUMNS),
+            pd.DataFrame(self._cdx_buffer, columns=CDX_COLUMNS),
             out,
             storage_options=self.cdx_storage_options,
         )
-        logger.info(f"Wrote {len(cdx_rows)} CDX row(s) -> {out}")
+        logger.info(f"Flushed {self._cdx_buffer_rows} CDX row(s) -> {out}")
+        self._cdx_flush_seq += 1
+        self._cdx_buffer = []
+        self._cdx_buffer_rows = 0
 
-    def process(self, task: FileGroupTask) -> DocumentBatch:
+    def process(self, task: FileGroupTask) -> DocumentBatch | None:
         streamer = self._get_streamer()
+        self._ensure_buffers()
+        # Terminal mode: self-write PDF parts and return None (nothing flows to the
+        # driver). Composable mode (no pdf_output_dir): accumulate + return a batch.
+        self_writing = bool(self.pdf_output_dir)
         rows: list[dict[str, Any]] = []
 
         for key in task.data:
@@ -206,22 +315,29 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
                     if callable(close):
                         close()
 
-                self._write_cdx(key, result.cdx_rows)
+                self._buffer_cdx(result.cdx_rows)
+                if self.add_filename_column:
+                    base = os.path.basename(key)
+                    for extracted in result.pdf_rows:
+                        extracted[self.filename_col] = base
+                if self_writing:
+                    self._buffer_pdf(result.pdf_rows)
+                else:
+                    rows.extend(result.pdf_rows)
                 logger.info(
                     f"{key}: layout={result.gzip_layout} responses={result.num_responses} "
                     f"pdfs={len(result.pdf_rows)} cdx={len(result.cdx_rows)}"
                 )
-                for extracted in result.pdf_rows:
-                    if self.add_filename_column:
-                        extracted[self.filename_col] = os.path.basename(key)
-                    rows.append(extracted)
             except Exception:  # noqa: BLE001
                 logger.exception(f"Failed streaming WARC object {key}")
                 continue
 
+        if self_writing:
+            # PDF written as a side effect; emit nothing downstream.
+            return None
         return DocumentBatch(
             dataset_name=task.dataset_name,
-            data=pd.DataFrame(rows, columns=self.outputs()[1]),
+            data=pd.DataFrame(rows, columns=self._pdf_columns()),
             _metadata={**task._metadata, "source_files": list(task.data)},
             _stage_perf=task._stage_perf,
         )
@@ -242,10 +358,15 @@ class S3StreamEaiCrawlStage(CompositeStage[EmptyTask, DocumentBatch]):
         region: str | None = None,
         url_limit: int | None = None,
         record_limit: int | None = None,
+        pdf_output_dir: str | None = None,
+        pdf_storage_options: dict[str, Any] | None = None,
+        pdf_rows_per_file: int = 2_000_000,
         cdx_output_dir: str | None = None,
         cdx_storage_options: dict[str, Any] | None = None,
         add_filename_column: bool | str = False,
         keys: list[str] | None = None,
+        stream_cpus: float = 1.0,
+        cdx_rows_per_file: int = 2_000_000,
     ) -> None:
         super().__init__()
         self.url_generator = S3WarcUrlGenerator(
@@ -264,9 +385,14 @@ class S3StreamEaiCrawlStage(CompositeStage[EmptyTask, DocumentBatch]):
                 endpoint_url=endpoint_url,
                 region=region,
                 record_limit=record_limit,
+                pdf_output_dir=pdf_output_dir,
+                pdf_storage_options=pdf_storage_options,
+                pdf_rows_per_file=pdf_rows_per_file,
                 cdx_output_dir=cdx_output_dir,
                 cdx_storage_options=cdx_storage_options,
                 add_filename_column=add_filename_column,
+                stream_cpus=stream_cpus,
+                cdx_rows_per_file=cdx_rows_per_file,
             ),
         ]
         self.name = "s3_stream_eai_crawl_pdf_extract"

@@ -34,8 +34,8 @@ credentials on the same endpoint — pass ``--output-rclone-remote eai-data``
 
 from __future__ import annotations
 
-import argparse
 import os
+import socket
 import sys
 from pathlib import Path
 
@@ -47,7 +47,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from nemo_curator.backends.xenna import XennaExecutor  # noqa: E402
+import argparse  # noqa: E402
+
 from nemo_curator.core.client import RayClient, SlurmRayClient  # noqa: E402
 from nemo_curator.core.constants import DEFAULT_RAY_TEMP_DIR  # noqa: E402
 from nemo_curator.pipeline import Pipeline  # noqa: E402
@@ -57,6 +58,16 @@ from tutorials.eai_crawl.s3_storage import (  # noqa: E402
     resolve_output_storage_options,
 )
 from tutorials.eai_crawl.stage import EaiCrawlDownloadExtractStage  # noqa: E402
+
+# Backends are imported lazily in build_executor() so a missing experimental
+# dependency for one backend doesn't break the others.
+#
+# Only ``ray_actor_pool`` invokes ``teardown()`` on stages, which the buffered
+# CDX writer (S3WarcStreamStage) needs to flush each worker's final partial
+# buffer. ``ray_data`` / ``xenna`` would silently drop that last CDX file per
+# worker — see the guard in main().
+_BACKENDS_WITH_TEARDOWN = {"ray_actor_pool"}
+_BACKEND_CHOICES = ("ray_actor_pool", "ray_data", "xenna")
 
 
 def parse_args() -> argparse.Namespace:
@@ -101,12 +112,44 @@ def parse_args() -> argparse.Namespace:
         "'#' comments are ignored.",
     )
     parser.add_argument("--record-limit", type=int, default=None, help="Max PDF records per WARC")
+    parser.add_argument(
+        "--stream-cpus",
+        type=float,
+        default=float(os.environ.get("EAI_STREAM_CPUS", "1.0")),
+        help="CPU reservation per WARC stream task (S3 --stream mode). Lower (e.g. 0.25) packs more "
+        "concurrent I/O-bound streams per node. Default 1.0 (or EAI_STREAM_CPUS).",
+    )
     parser.add_argument("--header-bytes", type=int, default=16384, help="Bytes per record range read (S3 range mode)")
     parser.add_argument(
         "--cdx-output-dir",
         default=None,
-        help="If set (S3 --stream mode), write one CDX Parquet per WARC "
-        "(local or s3://eai-warcs/cdx/<day>/)",
+        help="If set (S3 --stream mode), write consolidated CDX Parquet part files "
+        "(local or s3://eai-warcs/cdx/<day>/). Rows are buffered per worker and flushed "
+        "into ~--cdx-rows-per-file chunks instead of one tiny file per WARC.",
+    )
+    parser.add_argument(
+        "--cdx-rows-per-file",
+        type=int,
+        default=int(os.environ.get("EAI_CDX_ROWS_PER_FILE", "2000000")),
+        help="Target CDX rows per consolidated Parquet part (S3 --stream mode). Higher = "
+        "fewer/larger files. Default 2_000_000 (~250 MiB) or EAI_CDX_ROWS_PER_FILE.",
+    )
+    parser.add_argument(
+        "--pdf-rows-per-file",
+        type=int,
+        default=int(os.environ.get("EAI_PDF_ROWS_PER_FILE", "2000000")),
+        help="Target PDF-index rows per consolidated Parquet part (S3 --stream mode). PDFs "
+        "are rare, so per-worker buffers usually flush once at teardown (one file per worker) "
+        "rather than hitting this. Default 2_000_000 or EAI_PDF_ROWS_PER_FILE.",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=_BACKEND_CHOICES,
+        default=os.environ.get("EAI_BACKEND", "ray_actor_pool"),
+        help="Ray execution backend. Default 'ray_actor_pool' (or EAI_BACKEND): it is the "
+        "only backend that calls stage teardown(), required to flush the final buffered "
+        "CDX part. 'ray_data' exposes the Ray Data progress tab but drops the tail CDX "
+        "file per worker; 'xenna' is the legacy streaming executor.",
     )
     parser.add_argument(
         "--output-rclone-remote",
@@ -115,6 +158,24 @@ def parse_args() -> argparse.Namespace:
         "--cdx-output-dir are s3:// and EAI_OUT_AWS_* are unset.",
     )
     return parser.parse_args()
+
+
+def build_executor(backend: str):  # noqa: ANN201
+    """Instantiate the requested Ray execution backend (imported lazily)."""
+    if backend == "ray_actor_pool":
+        from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
+
+        return RayActorPoolExecutor()
+    if backend == "ray_data":
+        from nemo_curator.backends.ray_data import RayDataExecutor
+
+        return RayDataExecutor()
+    if backend == "xenna":
+        from nemo_curator.backends.xenna import XennaExecutor
+
+        return XennaExecutor(config={"execution_mode": "streaming"})
+    msg = f"Unknown backend: {backend!r} (choose from {_BACKEND_CHOICES})"
+    raise SystemExit(msg)
 
 
 def _load_keys_file(path: str) -> list[str]:
@@ -159,6 +220,11 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
     if args.s3_bucket and args.stream:
         from tutorials.eai_crawl.s3_streaming import S3StreamEaiCrawlStage
 
+        # Terminal, memory-safe writer: the stream stage buffers PDF + CDX rows per
+        # worker and writes consolidated parts itself (no per-WARC tiny files, and
+        # nothing large flows back to the RayActorPool driver). So we do NOT add a
+        # downstream ParquetWriter for this path.
+        remote_out = is_remote_url(args.output_dir)
         pipeline.add_stage(
             S3StreamEaiCrawlStage(
                 bucket=args.s3_bucket,
@@ -168,12 +234,19 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
                 region=args.s3_region,
                 url_limit=args.url_limit,
                 record_limit=args.record_limit,
+                pdf_output_dir=args.output_dir,
+                pdf_storage_options=write_opts if remote_out else None,
+                pdf_rows_per_file=args.pdf_rows_per_file,
                 cdx_output_dir=args.cdx_output_dir,
                 cdx_storage_options=write_opts if args.cdx_output_dir and is_remote_url(args.cdx_output_dir) else None,
                 keys=keys,
+                stream_cpus=args.stream_cpus,
+                cdx_rows_per_file=args.cdx_rows_per_file,
             )
         )
-    elif args.s3_bucket:
+        return pipeline
+
+    if args.s3_bucket:
         from tutorials.eai_crawl.s3_stage import S3EaiCrawlStage
 
         pipeline.add_stage(
@@ -196,6 +269,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
             )
         )
 
+    # Non-stream paths still return DocumentBatches; write them with the standard writer.
     writer_kwargs: dict = {}
     if is_remote_url(args.output_dir):
         writer_kwargs["storage_options"] = write_opts
@@ -203,8 +277,41 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
     return pipeline
 
 
+def _log_ray_dashboard(ray_client: RayClient) -> None:
+    """Log the Ray dashboard URL + SSH tunnel hint (works for any Ray backend).
+
+    The dashboard's cluster views (per-node CPU under "Logical Resources", the
+    Sent/Received network panels, actors) are populated by Ray core, so they are
+    available regardless of the execution backend — only Ray Data adds an extra
+    "Ray Data" progress tab on top.
+    """
+    host = socket.gethostname()
+    try:
+        ip = socket.gethostbyname(host)
+    except OSError:
+        ip = host
+    port = getattr(ray_client, "ray_dashboard_port", None)
+    if not port:
+        return
+    logger.info(
+        f"Ray dashboard: http://{ip}:{port}  (head node: {host})\n"
+        f"  SSH tunnel from your laptop:  ssh -N -L {port}:{ip}:{port} <login-host>\n"
+        f"  then open http://localhost:{port}"
+    )
+
+
 def main() -> int:
     args = parse_args()
+
+    # The streaming stage buffers PDF + CDX rows per worker and flushes the final
+    # partial part in teardown(); only ray_actor_pool invokes teardown. Warn loudly
+    # if the chosen backend would drop those tail parts (silently truncating output).
+    if args.s3_bucket and args.stream and args.backend not in _BACKENDS_WITH_TEARDOWN:
+        logger.warning(
+            f"--backend {args.backend} does not call stage teardown(): each worker's final "
+            f"buffered PDF/CDX part will be DROPPED (up to --pdf-rows-per-file/"
+            f"--cdx-rows-per-file rows each). Use --backend ray_actor_pool for complete output."
+        )
 
     # RayClient defaults to /tmp/ray which is often unwritable on shared login nodes.
     # Honor RAY_TMPDIR (set by submit.sh / the day-scale checklist).
@@ -215,18 +322,25 @@ def main() -> int:
     ray_client = client_cls(ray_temp_dir=ray_temp_dir)
     ray_client.start()
     # On SLURM worker nodes (SLURM_NODEID > 0) start() blocks; only the head continues.
+    _log_ray_dashboard(ray_client)
 
     try:
         pipeline = build_pipeline(args)
         logger.info(f"\n{pipeline.describe()}")
-        executor = XennaExecutor(config={"execution_mode": "streaming"})
+        logger.info(f"Executor backend: {args.backend}")
+        executor = build_executor(args.backend)
         results = pipeline.run(executor=executor)
     finally:
         ray_client.stop()
 
-    total_records = sum(task.num_items for task in results) if results else 0
-    logger.info(f"Collected {total_records} PDF URL(s) across {len(results) if results else 0} output batch(es)")
-    logger.info(f"Parquet output written to: {args.output_dir}")
+    if args.s3_bucket and args.stream:
+        # Terminal self-writing stage returns no tasks; per-file/row counts are in
+        # the per-worker "Flushed N ... row(s)" log lines.
+        logger.info("Streaming complete; PDF/CDX parts written by workers (see 'Flushed ...' log lines).")
+    else:
+        total_records = sum(task.num_items for task in results) if results else 0
+        logger.info(f"Collected {total_records} PDF URL(s) across {len(results) if results else 0} output batch(es)")
+    logger.info(f"PDF index output written to: {args.output_dir}")
     if args.cdx_output_dir:
         logger.info(f"CDX output written to: {args.cdx_output_dir}")
     return 0

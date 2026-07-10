@@ -75,10 +75,22 @@ EAI_OUTPUT_RCLONE_REMOTE="${EAI_OUTPUT_RCLONE_REMOTE:-}"
 # Optional byte-chunk manifest: file of WARC keys (one per line) spanning any days.
 # Must live on a shared FS (Lustre) so the head node can read it at run time.
 EAI_S3_KEYS_FILE="${EAI_S3_KEYS_FILE:-}"
+# Ray execution backend. Default ray_actor_pool: it is the only backend that
+# calls stage teardown(), needed to flush the final buffered CDX part per worker.
+EAI_BACKEND="${EAI_BACKEND:-}"
+# Target CDX rows per consolidated Parquet part (~2M rows ~= 250 MiB).
+EAI_CDX_ROWS_PER_FILE="${EAI_CDX_ROWS_PER_FILE:-}"
+# Target PDF-index rows per consolidated Parquet part (PDFs are rare; usually one
+# file per worker flushed at teardown).
+EAI_PDF_ROWS_PER_FILE="${EAI_PDF_ROWS_PER_FILE:-}"
 
 # Build source-specific args.
 if [[ -n "${EAI_S3_BUCKET}" ]]; then
-    SOURCE_ARGS="--s3-bucket ${EAI_S3_BUCKET} --s3-prefix ${EAI_S3_PREFIX}"
+    SOURCE_ARGS="--s3-bucket ${EAI_S3_BUCKET}"
+    # Only pass --s3-prefix when non-empty: in byte-chunk (keys-file) mode the
+    # prefix is empty, and an empty unquoted value collapses to nothing, leaving
+    # a bare "--s3-prefix" that argparse rejects ("expected one argument").
+    [[ -n "${EAI_S3_PREFIX}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --s3-prefix ${EAI_S3_PREFIX}"
     [[ -n "${EAI_S3_ENDPOINT_URL}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --s3-endpoint-url ${EAI_S3_ENDPOINT_URL}"
     # Streaming is required for compressed .warc.gz (e.g. the EAI crawl).
     [[ -n "${EAI_STREAM}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --stream"
@@ -90,7 +102,11 @@ else
     exit 1
 fi
 [[ -n "${EAI_URL_LIMIT}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --url-limit ${EAI_URL_LIMIT}"
+[[ -n "${EAI_STREAM_CPUS:-}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --stream-cpus ${EAI_STREAM_CPUS}"
+[[ -n "${EAI_BACKEND}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --backend ${EAI_BACKEND}"
 [[ -n "${EAI_CDX_OUTPUT_DIR}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --cdx-output-dir ${EAI_CDX_OUTPUT_DIR}"
+[[ -n "${EAI_CDX_ROWS_PER_FILE}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --cdx-rows-per-file ${EAI_CDX_ROWS_PER_FILE}"
+[[ -n "${EAI_PDF_ROWS_PER_FILE}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --pdf-rows-per-file ${EAI_PDF_ROWS_PER_FILE}"
 [[ -n "${EAI_OUTPUT_RCLONE_REMOTE}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --output-rclone-remote ${EAI_OUTPUT_RCLONE_REMOTE}"
 
 # Fail fast if S3 read creds are missing: without this the whole allocation boots
@@ -117,6 +133,7 @@ echo "  Source : ${SOURCE_ARGS}"
 echo "  Keys   : ${EAI_S3_KEYS_FILE:-"(prefix listing)"}"
 echo "  Output : ${EAI_OUTPUT_DIR}"
 echo "  CDX    : ${EAI_CDX_OUTPUT_DIR:-"(disabled)"}"
+echo "  Backend: ${EAI_BACKEND:-"ray_actor_pool (default)"}"
 echo "=================================================="
 
 mkdir -p logs

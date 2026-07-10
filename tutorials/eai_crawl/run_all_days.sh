@@ -152,27 +152,40 @@ run_bytes_mode() {
     total_bytes=$(awk -F';' '{s+=$1} END{printf "%d", s}' "$enum_tmp")
     [[ "$total_warcs" -gt 0 ]] || { echo "No WARCs found." >&2; rm -f "$enum_tmp"; exit 1; }
 
-    # Greedy pack into chunks (pass 1): write one manifest per chunk.
-    local chunk_idx=0 cur_bytes=0 cur_n=0 manifest=""
-    declare -a M_FILE M_BYTES M_N
-    while IFS=';' read -r sz key; do
-        [[ -z "$key" ]] && continue
-        if (( cur_n == 0 )); then
-            manifest="${CHUNK_DIR}/chunk_$(printf '%04d' "$chunk_idx").keys"
-            : > "$manifest"
-        fi
-        printf '%s\n' "$key" >> "$manifest"
-        cur_bytes=$((cur_bytes + sz)); cur_n=$((cur_n + 1))
-        if (( cur_bytes >= bytes_per_job )); then
-            M_FILE[chunk_idx]="$manifest"; M_BYTES[chunk_idx]=$cur_bytes; M_N[chunk_idx]=$cur_n
-            chunk_idx=$((chunk_idx + 1)); cur_bytes=0; cur_n=0
-        fi
-    done < "$enum_tmp"
-    if (( cur_n > 0 )); then
-        M_FILE[chunk_idx]="$manifest"; M_BYTES[chunk_idx]=$cur_bytes; M_N[chunk_idx]=$cur_n
-        chunk_idx=$((chunk_idx + 1))
-    fi
+    # Greedy pack into chunks (pass 1). Done in a single awk pass: bash while-read
+    # over millions of lines (reopening a manifest per line) took ~1h; awk keeps
+    # each manifest open and closes it when the chunk fills, so this is seconds.
+    # awk writes the manifests and a meta file of "idx;path;bytes;nwarcs" per chunk.
+    local meta_file
+    meta_file="$(mktemp)"
+    awk -F';' -v dir="$CHUNK_DIR" -v cap="$bytes_per_job" -v meta="$meta_file" '
+        BEGIN { idx = 0; cur = 0; n = 0; man = "" }
+        $2 == "" { next }
+        {
+            if (n == 0) { man = sprintf("%s/chunk_%04d.keys", dir, idx) }
+            print $2 > man          # first write truncates; awk appends after
+            cur += $1; n++
+            if (cur >= cap) {
+                close(man)
+                printf "%d;%s;%d;%d\n", idx, man, cur, n >> meta
+                idx++; cur = 0; n = 0
+            }
+        }
+        END {
+            if (n > 0) { close(man); printf "%d;%s;%d;%d\n", idx, man, cur, n >> meta }
+        }
+    ' "$enum_tmp"
     rm -f "$enum_tmp"
+
+    # Load chunk metadata back into arrays.
+    local chunk_idx=0
+    declare -a M_FILE M_BYTES M_N
+    local _idx _man _bytes _n
+    while IFS=';' read -r _idx _man _bytes _n; do
+        M_FILE[_idx]="$_man"; M_BYTES[_idx]="$_bytes"; M_N[_idx]="$_n"
+        chunk_idx=$((_idx + 1))
+    done < "$meta_file"
+    rm -f "$meta_file"
 
     local tib_total
     tib_total=$(awk -v b="$total_bytes" 'BEGIN{printf "%.2f", b/1099511627776}')
