@@ -169,3 +169,13 @@ fern/product-docs/
 
 # PDF parsing data (symlinked to external storage)
 pdf_parsing/
+
+# Personal debugging tool (not part of any tutorial)
+/deletion_watch.py
+
+# Local run artifacts
+/logs/
+/output/
+
+# Large PubMed input data (multi-GB; not for version control)
+tutorials/filter_pubmed_pdfs_for_commercial_use/*.csv
