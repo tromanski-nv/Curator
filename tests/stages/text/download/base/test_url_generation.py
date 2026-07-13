@@ -164,6 +164,23 @@ class TestURLGenerationStage:
         for i, task in enumerate(result):
             assert task.data == [urls[i]]
 
+    def test_process_groups_urls_into_stable_source_tasks(self) -> None:
+        urls = [f"https://example.com/{i}" for i in range(5)]
+        stage = URLGenerationStage(url_generator=MockURLGenerator(urls), urls_per_task=2)
+
+        result = stage.process(EmptyTask())
+
+        assert [task.data for task in result] == [urls[:2], urls[2:4], urls[4:]]
+        assert result[0]._metadata == {"source_urls": urls[:2]}
+        assert (
+            result[0].get_deterministic_id()
+            == FileGroupTask(dataset_name="test", data=urls[:2]).get_deterministic_id()
+        )
+
+    def test_urls_per_task_must_be_positive(self) -> None:
+        with pytest.raises(ValueError, match="at least 1"):
+            URLGenerationStage(url_generator=MockURLGenerator(), urls_per_task=0)
+
     def test_process_empty_url_list(self) -> None:
         """Test processing when generator returns empty URL list."""
         generator = MockURLGenerator(urls=[])

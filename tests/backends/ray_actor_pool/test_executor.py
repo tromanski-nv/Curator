@@ -81,7 +81,8 @@ class TestRayActorPoolExecutor:
 
         def _get(fut: str) -> None:
             if fut == "fut-1":
-                raise _FakeRayError("boom")
+                msg = "boom"
+                raise _FakeRayError(msg)
 
         with mock.patch.object(executor_mod, "ray") as mock_ray:
             mock_ray.get.side_effect = _get
@@ -89,12 +90,16 @@ class TestRayActorPoolExecutor:
             mock_ray.exceptions.RayActorError = _FakeRayError
             mock_ray.exceptions.RaySystemError = _FakeRayError
 
-            with mock.patch.object(executor_mod, "logger") as mock_logger:
+            with (
+                mock.patch.object(executor_mod, "logger") as mock_logger,
+                pytest.raises(RuntimeError, match=r"actor\(s\): 1"),
+            ):
                 RayActorPoolExecutor._cleanup_actors(mock.Mock(), actors)
-                mock_logger.warning.assert_called_once()
+            mock_logger.error.assert_called_once()
 
-        # Actor 1 failed its teardown (so it is not killed), but 0 and 2 still are.
-        assert killed == [0, 2]
+        # Every actor is killed after all teardown futures are collected, and the
+        # aggregate failure prevents the pipeline from reporting success.
+        assert killed == [0, 1, 2]
 
     @pytest.mark.parametrize(
         ("available_cpus", "expected_actors", "expected_warning"),

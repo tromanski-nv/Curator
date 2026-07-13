@@ -416,6 +416,10 @@ class SlurmRayClient(RayClient):
             self._cleanup_local_ray()
 
         if len(self._slurm_nodes) <= 1 or node_id == 0:
+            # A requeued SLURM job can reuse its job ID. Remove an intent marker
+            # from the previous attempt before publishing this attempt's port.
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(self._shutdown_intent_file(slurm_job_id))
             # Head node — start Ray head (super().start() selects the actual port via get_free_port)
             super().start()
             # Broadcast the actual port the head chose so workers don't have to guess.
@@ -441,6 +445,7 @@ class SlurmRayClient(RayClient):
         if self._manages_cluster:
             slurm_job_id = os.environ.get("SLURM_JOB_ID")
             if slurm_job_id:
+                self._write_shutdown_intent(slurm_job_id)
                 port_file = self._head_port_file(slurm_job_id)
                 with contextlib.suppress(FileNotFoundError):
                     os.remove(port_file)
@@ -461,6 +466,22 @@ class SlurmRayClient(RayClient):
         broadcast_dir = os.environ.get("RAY_PORT_BROADCAST_DIR", "/tmp")  # noqa: S108
         os.makedirs(broadcast_dir, exist_ok=True)
         return os.path.join(broadcast_dir, f"ray_head_port_{slurm_job_id}")
+
+    def _shutdown_intent_file(self, slurm_job_id: str) -> str:
+        """Return the shared marker proving the head intentionally stopped Ray."""
+        return os.path.join(os.path.dirname(self._head_port_file(slurm_job_id)), f"ray_shutdown_{slurm_job_id}")
+
+    def _write_shutdown_intent(self, slurm_job_id: str) -> None:
+        """Atomically announce intentional shutdown before terminating the GCS."""
+        intent_file = self._shutdown_intent_file(slurm_job_id)
+        intent_dir = os.path.dirname(intent_file)
+        with tempfile.NamedTemporaryFile(mode="w", dir=intent_dir, delete=False) as f:
+            tmp_path = f.name
+            f.write("intentional\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, intent_file)
+        logger.info(f"SlurmRayClient head: wrote shutdown intent to {intent_file}")
 
     def _write_head_port(self, slurm_job_id: str) -> None:
         """Write the actual Ray GCS port to a shared file so workers can read it.
@@ -522,6 +543,13 @@ class SlurmRayClient(RayClient):
         logger.info(f"Ray worker starting: {' '.join(cmd)}")
         result = subprocess.run(cmd, check=False)  # noqa: S603
         logger.info(f"Ray worker exited with code {result.returncode}")
+        slurm_job_id = os.environ.get("SLURM_JOB_ID")
+        if result.returncode != 0 and slurm_job_id and os.path.exists(self._shutdown_intent_file(slurm_job_id)):
+            logger.info(
+                f"Ray worker exit code {result.returncode} followed an intentional head shutdown; "
+                "normalizing the worker exit to 0."
+            )
+            return 0
         return result.returncode
 
     def _cleanup_local_ray(self) -> None:

@@ -374,13 +374,31 @@ class RayActorPoolExecutor(BaseExecutor):
         for pools with many actors whose teardown does I/O (e.g. flushing buffered
         output parts to remote storage).
         """
-        teardown_futures = [actor.teardown.remote() for actor in actors]
-        for i, (actor, future) in enumerate(zip(actors, teardown_futures)):
+        errors: list[tuple[int, Exception]] = []
+        teardown_futures = []
+        for i, actor in enumerate(actors):
             try:
-                ray.get(future)
-                ray.kill(actor)
+                teardown_futures.append(actor.teardown.remote())
             except (ray.exceptions.RayActorError, ray.exceptions.RaySystemError) as e:
-                logger.warning(f"      Warning: Error cleaning up actor {i}: {e}")
+                teardown_futures.append(None)
+                errors.append((i, e))
+                logger.error(f"      Error dispatching teardown for actor {i}: {e}")
+        for i, (actor, future) in enumerate(zip(actors, teardown_futures, strict=True)):
+            try:
+                if future is not None:
+                    ray.get(future)
+            except (ray.exceptions.RayActorError, ray.exceptions.RaySystemError) as e:
+                errors.append((i, e))
+                logger.error(f"      Error cleaning up actor {i}: {e}")
+            finally:
+                try:
+                    ray.kill(actor)
+                except (ray.exceptions.RayActorError, ray.exceptions.RaySystemError) as e:
+                    logger.warning(f"      Warning: Error killing actor {i}: {e}")
+        if errors:
+            failed = ", ".join(str(i) for i, _ in errors)
+            msg = f"Stage teardown failed for actor(s): {failed}"
+            raise RuntimeError(msg) from errors[0][1]
 
     def _cleanup_actor_pool(self, actor_pool: ActorPool) -> None:
         """Clean up actors in the pool."""

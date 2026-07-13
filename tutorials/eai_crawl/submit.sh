@@ -57,11 +57,29 @@ if [[ ! -f "${VENV_PATH}/bin/activate" ]]; then
     exit 1
 fi
 
-# Shared dir for Ray port broadcast — must be visible to ALL nodes.
+# Shared dir for Ray port broadcast — must be visible to ALL nodes. When
+# CURATOR_DIR is a frozen snapshot this may not exist yet, so create it.
 export RAY_PORT_BROADCAST_DIR="${CURATOR_DIR}/logs"
+mkdir -p "${RAY_PORT_BROADCAST_DIR}"
 export RAY_TMPDIR="/tmp/ray_${SLURM_JOB_ID}"
 # Do NOT use `uv run` under Ray — workers relaunch with a bare `uv run` that can
 # rebuild an empty .venv (ModuleNotFoundError: ray). Activate the synced venv instead.
+
+# SLURM job-array mode: one array task == one chunk. Derive the per-chunk keys
+# file and output prefixes from SLURM_ARRAY_TASK_ID + templates, since every
+# array task shares the same submission environment (run_all_days.sh can't pass
+# distinct EAI_OUTPUT_DIR per task). Only engages when both are present, so the
+# single-job path (explicit EAI_* below) is unaffected.
+if [[ -n "${SLURM_ARRAY_TASK_ID:-}" && -n "${EAI_KEYS_DIR:-}" ]]; then
+    _cid="$(printf '%04d' "${SLURM_ARRAY_TASK_ID}")"
+    : "${EAI_OUT_BUCKET:?array mode needs EAI_OUT_BUCKET}"
+    EAI_S3_KEYS_FILE="${EAI_KEYS_DIR}/chunk_${_cid}.keys"
+    EAI_OUTPUT_DIR="s3://${EAI_OUT_BUCKET}/${EAI_PDF_PREFIX:-pdf_url_idx}/chunk=${_cid}/"
+    EAI_CDX_OUTPUT_DIR="s3://${EAI_OUT_BUCKET}/${EAI_CDX_PREFIX:-cdx}/chunk=${_cid}/"
+    : "${EAI_CHECKPOINT_ROOT:?array mode needs EAI_CHECKPOINT_ROOT}"
+    EAI_CHECKPOINT_PATH="${EAI_CHECKPOINT_ROOT}/chunk_${_cid}"
+    export EAI_S3_KEYS_FILE EAI_OUTPUT_DIR EAI_CDX_OUTPUT_DIR EAI_CHECKPOINT_PATH
+fi
 
 EAI_OUTPUT_DIR="${EAI_OUTPUT_DIR:?Set EAI_OUTPUT_DIR (local path or s3://eai-warcs/pdf_url_idx/<day>/)}"
 EAI_WARC_DIR="${EAI_WARC_DIR:-}"
@@ -75,14 +93,14 @@ EAI_OUTPUT_RCLONE_REMOTE="${EAI_OUTPUT_RCLONE_REMOTE:-}"
 # Optional byte-chunk manifest: file of WARC keys (one per line) spanning any days.
 # Must live on a shared FS (Lustre) so the head node can read it at run time.
 EAI_S3_KEYS_FILE="${EAI_S3_KEYS_FILE:-}"
-# Ray execution backend. Default ray_actor_pool: it is the only backend that
-# calls stage teardown(), needed to flush the final buffered CDX part per worker.
+# Ray execution backend. Default ray_actor_pool.
 EAI_BACKEND="${EAI_BACKEND:-}"
 # Target CDX rows per consolidated Parquet part (~2M rows ~= 250 MiB).
 EAI_CDX_ROWS_PER_FILE="${EAI_CDX_ROWS_PER_FILE:-}"
-# Target PDF-index rows per consolidated Parquet part (PDFs are rare; usually one
-# file per worker flushed at teardown).
+# Target PDF-index rows per deterministic source-group part.
 EAI_PDF_ROWS_PER_FILE="${EAI_PDF_ROWS_PER_FILE:-}"
+EAI_WARCS_PER_TASK="${EAI_WARCS_PER_TASK:-}"
+EAI_CHECKPOINT_PATH="${EAI_CHECKPOINT_PATH:-}"
 
 # Build source-specific args.
 if [[ -n "${EAI_S3_BUCKET}" ]]; then
@@ -107,6 +125,8 @@ fi
 [[ -n "${EAI_CDX_OUTPUT_DIR}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --cdx-output-dir ${EAI_CDX_OUTPUT_DIR}"
 [[ -n "${EAI_CDX_ROWS_PER_FILE}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --cdx-rows-per-file ${EAI_CDX_ROWS_PER_FILE}"
 [[ -n "${EAI_PDF_ROWS_PER_FILE}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --pdf-rows-per-file ${EAI_PDF_ROWS_PER_FILE}"
+[[ -n "${EAI_WARCS_PER_TASK}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --warcs-per-task ${EAI_WARCS_PER_TASK}"
+[[ -n "${EAI_CHECKPOINT_PATH}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --checkpoint-path ${EAI_CHECKPOINT_PATH}"
 [[ -n "${EAI_OUTPUT_RCLONE_REMOTE}" ]] && SOURCE_ARGS="${SOURCE_ARGS} --output-rclone-remote ${EAI_OUTPUT_RCLONE_REMOTE}"
 
 # Fail fast if S3 read creds are missing: without this the whole allocation boots
@@ -133,6 +153,7 @@ echo "  Source : ${SOURCE_ARGS}"
 echo "  Keys   : ${EAI_S3_KEYS_FILE:-"(prefix listing)"}"
 echo "  Output : ${EAI_OUTPUT_DIR}"
 echo "  CDX    : ${EAI_CDX_OUTPUT_DIR:-"(disabled)"}"
+echo "  Checkpt: ${EAI_CHECKPOINT_PATH:-"(disabled)"}"
 echo "  Backend: ${EAI_BACKEND:-"ray_actor_pool (default)"}"
 echo "=================================================="
 
@@ -152,6 +173,13 @@ cd '${CURATOR_DIR}'
 source '${VENV_PATH}/bin/activate'
 export RAY_TMPDIR=/tmp/ray_\${SLURM_JOB_ID}
 export RAY_PORT_BROADCAST_DIR='${CURATOR_DIR}/logs'
+# EAI manifests are already pre-sharded by the outer SLURM array. Present each
+# chunk to Curator as one logical shard so native source filtering does not
+# partition it a second time, while retaining FailedTask/completion manifests.
+export NEMO_CURATOR_SLURM_ARRAY_ENABLED=1
+export NEMO_CURATOR_SLURM_ARRAY_SHARD_INDEX=0
+export NEMO_CURATOR_SLURM_ARRAY_TOTAL_SHARDS=1
+export NEMO_CURATOR_SLURM_ARRAY_MINIMUM_SHARD_INDEX=0
 # Read creds (team-vendor-data) for WARC streaming.
 export AWS_ACCESS_KEY_ID='${AWS_ACCESS_KEY_ID:-}'
 export AWS_SECRET_ACCESS_KEY='${AWS_SECRET_ACCESS_KEY:-}'

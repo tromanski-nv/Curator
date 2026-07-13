@@ -293,6 +293,24 @@ class TestRunAsWorker:
         )
         assert SlurmRayClient()._run_as_worker("10.0.0.1") == 1
 
+    def test_nonzero_exit_normalized_after_intentional_shutdown(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import nemo_curator.core.client as _client
+
+        monkeypatch.setenv("RAY_PORT_BROADCAST_DIR", str(tmp_path))
+        monkeypatch.setenv("SLURM_JOB_ID", "12345")
+        monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/ray")
+        monkeypatch.setattr(
+            _client.subprocess,
+            "run",
+            lambda _cmd, **_kw: subprocess.CompletedProcess(args=[], returncode=1),
+        )
+        client = SlurmRayClient()
+        client._write_shutdown_intent("12345")
+
+        assert client._run_as_worker("10.0.0.1") == 0
+
 
 # --------------------------------------------------------------------------- #
 # _cleanup_local_ray
@@ -453,6 +471,7 @@ class TestSlurmRayClientStopManagesCluster:
 
         client.stop()
         assert not os.path.exists(port_file)
+        assert os.path.exists(client._shutdown_intent_file("99999"))
 
     def test_no_port_file_does_not_raise(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("RAY_PORT_BROADCAST_DIR", str(tmp_path))

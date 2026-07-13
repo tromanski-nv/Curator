@@ -20,8 +20,8 @@ object through ``warcio`` and extracts PDF URL/metadata on the fly. Optionally
 also writes a per-WARC CDX-style index (``offset`` / ``length``) for later O(1)
 range-fetch of filtered records.
 
-``URLGenerationStage`` already emits **one ``FileGroupTask`` per WARC object**,
-so each Ray worker processes a single shard — the right unit for day-scale jobs.
+``URLGenerationStage`` emits deterministic groups of WARC objects. Grouping
+reduces output-file count while preserving source-level retry boundaries.
 
 This is the correct path for the EssentialAI crawl layout:
 ``s3://<bucket>/eai-warc/<YYYYMMDD>/<uuid>.warc.gz``.
@@ -35,7 +35,6 @@ Path-style addressing is used (required by many S3-compatible endpoints).
 from __future__ import annotations
 
 import os
-import socket
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any
@@ -46,7 +45,7 @@ from loguru import logger
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.resources import Resources
 from nemo_curator.stages.text.download.base.url_generation import URLGenerationStage
-from nemo_curator.tasks import DocumentBatch, EmptyTask, FileGroupTask
+from nemo_curator.tasks import DocumentBatch, EmptyTask, FailedTask, FileGroupTask
 from tutorials.eai_crawl.cdx_index import CDX_COLUMNS, iterate_cdx_and_pdfs
 from tutorials.eai_crawl.s3_storage import ensure_parent, is_remote_url, write_parquet
 from tutorials.eai_crawl.s3_url_generation import S3WarcUrlGenerator
@@ -131,13 +130,11 @@ class S3ObjectStreamer(ObjectStreamer):
 class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
     """Stream ``.warc.gz`` objects; write PDF URL rows and CDX offsets.
 
-    Both outputs are written **per worker** as a side effect: rows are buffered
-    across the many WARCs a worker handles and flushed as consolidated
-    ``part-*.parquet`` files once a buffer reaches its ``*_rows_per_file`` target
-    (with a final flush on ``teardown``). This avoids the millions-of-tiny-files
-    problem of the default one-file-per-task writer — critical here because the
-    fan-out is one Ray task per WARC and most WARCs contain no PDFs (so a per-task
-    writer would emit hundreds of thousands of empty PDF files per chunk).
+    Each input task contains a deterministic group of WARC keys. Both outputs
+    are buffered only for that group and written to deterministic
+    ``part-<group-hash>-<seq>.parquet`` names before ``process`` returns. Native
+    resumability therefore marks a group complete only after its output is
+    durable, while retries overwrite rather than append duplicate parts.
 
     When ``pdf_output_dir`` is set the stage is **terminal**: it writes PDF parts
     itself and returns ``None`` (no ``DocumentBatch`` flows downstream), which
@@ -146,9 +143,9 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
     ``pdf_output_dir`` is unset it falls back to returning a ``DocumentBatch`` so
     the stage stays composable with a downstream writer.
 
-    Buffering across WARCs requires stateful workers + a guaranteed final flush,
-    so this stage overrides ``setup``/``teardown`` (making it an actor stage) and
-    must run on an executor that invokes ``teardown`` (e.g. RayActorPoolExecutor).
+    A failed WARC returns ``FailedTask`` for the whole group. Successfully parsed
+    rows may already have been written, but the stable paths are overwritten when
+    that same source group is retried.
     """
 
     bucket: str | None = None
@@ -160,13 +157,11 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
     # a DocumentBatch for a downstream writer instead.
     pdf_output_dir: str | None = None
     pdf_storage_options: dict[str, Any] | None = None
-    # Consolidated PDF file target, in rows. PDFs are rare, so per-worker buffers
-    # usually flush once at teardown rather than hitting this mid-run.
+    # Consolidated PDF file target, in rows within one source group.
     pdf_rows_per_file: int = 2_000_000
     cdx_output_dir: str | None = None
     cdx_storage_options: dict[str, Any] | None = None
-    # Consolidated CDX file size target, in rows. Calibrate to ~250 MiB on disk
-    # from an observed file (rows = target_bytes / (bytes/row)).
+    # Consolidated CDX file target within one source group.
     cdx_rows_per_file: int = 2_000_000
     # file_name is redundant with warc_filename's basename; off by default.
     add_filename_column: bool | str = False
@@ -188,14 +183,6 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
             if out_dir and not is_remote_url(out_dir):
                 ensure_parent(out_dir)
 
-    def setup(self, worker_metadata: Any = None) -> None:  # noqa: ANN401, ARG002
-        self._init_buffers()
-
-    def teardown(self) -> None:
-        # Flush the final partial buffers (relies on the executor calling teardown).
-        self._flush_pdf(force=True)
-        self._flush_cdx(force=True)
-
     def inputs(self) -> tuple[list[str], list[str]]:
         return (["data"], [])
 
@@ -215,28 +202,21 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
             if not self.bucket:
                 msg = "S3WarcStreamStage requires a bucket (or an injected streamer)"
                 raise ValueError(msg)
-            self._s3_streamer = S3ObjectStreamer(
-                self.bucket, endpoint_url=self.endpoint_url, region=self.region
-            )
+            self._s3_streamer = S3ObjectStreamer(self.bucket, endpoint_url=self.endpoint_url, region=self.region)
         return self._s3_streamer
 
-    def _init_buffers(self) -> None:
-        # Per-worker buffer state (reset seq/tag on each worker).
+    def _init_buffers(self, group_tag: str) -> None:
+        # Per-source-group state. It never survives a process() boundary.
         self._pdf_buffer: list[dict[str, Any]] = []
         self._pdf_buffer_rows = 0
         self._pdf_flush_seq = 0
         self._cdx_buffer: list[dict[str, Any]] = []
         self._cdx_buffer_rows = 0
         self._cdx_flush_seq = 0
-        self._worker_tag = f"{socket.gethostname()}-{os.getpid()}"
-
-    def _ensure_buffers(self) -> None:
-        # Lazy init so direct process() calls (e.g. in tests) work without setup().
-        if not hasattr(self, "_worker_tag"):
-            self._init_buffers()
+        self._group_tag = group_tag
 
     def _part_path(self, out_dir: str, seq: int) -> str:
-        name = f"part-{self._worker_tag}-{seq:05d}.parquet"
+        name = f"part-{self._group_tag}-{seq:05d}.parquet"
         if is_remote_url(out_dir):
             return out_dir.rstrip("/") + f"/{name}"
         return str(Path(out_dir) / name)
@@ -244,7 +224,6 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
     def _buffer_pdf(self, pdf_rows: list[dict[str, Any]]) -> None:
         if not self.pdf_output_dir or not pdf_rows:
             return
-        self._ensure_buffers()
         self._pdf_buffer.extend(pdf_rows)
         self._pdf_buffer_rows += len(pdf_rows)
         if self._pdf_buffer_rows >= self.pdf_rows_per_file:
@@ -253,7 +232,6 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
     def _flush_pdf(self, *, force: bool = False) -> None:
         if not self.pdf_output_dir:
             return
-        self._ensure_buffers()
         if not self._pdf_buffer or (not force and self._pdf_buffer_rows < self.pdf_rows_per_file):
             return
         out = self._part_path(self.pdf_output_dir, self._pdf_flush_seq)
@@ -270,7 +248,6 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
     def _buffer_cdx(self, cdx_rows: list[dict[str, Any]]) -> None:
         if not self.cdx_output_dir or not cdx_rows:
             return
-        self._ensure_buffers()
         self._cdx_buffer.extend(cdx_rows)
         self._cdx_buffer_rows += len(cdx_rows)
         if self._cdx_buffer_rows >= self.cdx_rows_per_file:
@@ -279,7 +256,6 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
     def _flush_cdx(self, *, force: bool = False) -> None:
         if not self.cdx_output_dir:
             return
-        self._ensure_buffers()
         if not self._cdx_buffer or (not force and self._cdx_buffer_rows < self.cdx_rows_per_file):
             return
         out = self._part_path(self.cdx_output_dir, self._cdx_flush_seq)
@@ -293,13 +269,18 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
         self._cdx_buffer = []
         self._cdx_buffer_rows = 0
 
-    def process(self, task: FileGroupTask) -> DocumentBatch | None:
+    def process(self, task: FileGroupTask) -> DocumentBatch | FailedTask | None:
         streamer = self._get_streamer()
-        self._ensure_buffers()
+        group_tag = task.get_deterministic_id()
+        if not group_tag:
+            msg = "FileGroupTask must provide a deterministic ID for resumable output"
+            raise ValueError(msg)
+        self._init_buffers(group_tag)
         # Terminal mode: self-write PDF parts and return None (nothing flows to the
         # driver). Composable mode (no pdf_output_dir): accumulate + return a batch.
         self_writing = bool(self.pdf_output_dir)
         rows: list[dict[str, Any]] = []
+        failed = False
 
         for key in task.data:
             try:
@@ -330,7 +311,14 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(f"Failed streaming WARC object {key}")
-                continue
+                failed = True
+
+        # Commit this source group's final partial files before the adapter can
+        # decrement its resumability counter.
+        self._flush_pdf(force=True)
+        self._flush_cdx(force=True)
+        if failed:
+            return FailedTask()
 
         if self_writing:
             # PDF written as a side effect; emit nothing downstream.
@@ -346,7 +334,7 @@ class S3WarcStreamStage(ProcessingStage[FileGroupTask, DocumentBatch]):
 class S3StreamEaiCrawlStage(CompositeStage[EmptyTask, DocumentBatch]):
     """List S3/SwiftStack WARC objects and collect PDF URLs by streaming each object.
 
-    Fan-out is one Ray task per WARC (via ``URLGenerationStage``).
+    Fan-out is one Ray task per deterministic WARC group.
     """
 
     def __init__(  # noqa: PLR0913
@@ -365,6 +353,7 @@ class S3StreamEaiCrawlStage(CompositeStage[EmptyTask, DocumentBatch]):
         cdx_storage_options: dict[str, Any] | None = None,
         add_filename_column: bool | str = False,
         keys: list[str] | None = None,
+        warcs_per_task: int = 32,
         stream_cpus: float = 1.0,
         cdx_rows_per_file: int = 2_000_000,
     ) -> None:
@@ -379,7 +368,11 @@ class S3StreamEaiCrawlStage(CompositeStage[EmptyTask, DocumentBatch]):
             keys=keys,
         )
         self.stages = [
-            URLGenerationStage(url_generator=self.url_generator, limit=url_limit),
+            URLGenerationStage(
+                url_generator=self.url_generator,
+                limit=url_limit,
+                urls_per_task=warcs_per_task,
+            ),
             S3WarcStreamStage(
                 bucket=bucket,
                 endpoint_url=endpoint_url,

@@ -21,7 +21,8 @@ credentials on the same endpoint — pass ``--output-rclone-remote eai-data``
 
     # Day smoke -> eai-data bucket (rclone remote):
     export AWS_*                 # team-vendor-data (read)
-    uv run --group eai-warcs --extra text_cpu python tutorials/eai_crawl/run_slurm.py \\
+    source .venv/bin/activate
+    python tutorials/eai_crawl/run_slurm.py \\
         --s3-bucket vdi-169-essentialai-essentialai-data \\
         --s3-prefix eai-warc/20240814/ --stream --url-limit 2 \\
         --s3-endpoint-url https://pdx.s8k.io \\
@@ -37,6 +38,7 @@ from __future__ import annotations
 import os
 import socket
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 from loguru import logger
@@ -53,6 +55,13 @@ from nemo_curator.core.client import RayClient, SlurmRayClient  # noqa: E402
 from nemo_curator.core.constants import DEFAULT_RAY_TEMP_DIR  # noqa: E402
 from nemo_curator.pipeline import Pipeline  # noqa: E402
 from nemo_curator.stages.text.io.writer import ParquetWriter  # noqa: E402
+from tutorials.eai_crawl.resume import (  # noqa: E402
+    OUTPUT_LAYOUT_VERSION,
+    initialize_output,
+    manifest_identity,
+    success_marker_path,
+    write_json,
+)
 from tutorials.eai_crawl.s3_storage import (  # noqa: E402
     is_remote_url,
     resolve_output_storage_options,
@@ -62,11 +71,6 @@ from tutorials.eai_crawl.stage import EaiCrawlDownloadExtractStage  # noqa: E402
 # Backends are imported lazily in build_executor() so a missing experimental
 # dependency for one backend doesn't break the others.
 #
-# Only ``ray_actor_pool`` invokes ``teardown()`` on stages, which the buffered
-# CDX writer (S3WarcStreamStage) needs to flush each worker's final partial
-# buffer. ``ray_data`` / ``xenna`` would silently drop that last CDX file per
-# worker — see the guard in main().
-_BACKENDS_WITH_TEARDOWN = {"ray_actor_pool"}
 _BACKEND_CHOICES = ("ray_actor_pool", "ray_data", "xenna")
 
 
@@ -119,13 +123,25 @@ def parse_args() -> argparse.Namespace:
         help="CPU reservation per WARC stream task (S3 --stream mode). Lower (e.g. 0.25) packs more "
         "concurrent I/O-bound streams per node. Default 1.0 (or EAI_STREAM_CPUS).",
     )
+    parser.add_argument(
+        "--warcs-per-task",
+        type=int,
+        default=int(os.environ.get("EAI_WARCS_PER_TASK", "32")),
+        help="Deterministic WARC source-group size. Each group writes idempotent consolidated parts "
+        "and is the native resume unit. Default 32 or EAI_WARCS_PER_TASK.",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        default=os.environ.get("EAI_CHECKPOINT_PATH"),
+        help="Shared local/Lustre checkpoint directory for native resumability.",
+    )
     parser.add_argument("--header-bytes", type=int, default=16384, help="Bytes per record range read (S3 range mode)")
     parser.add_argument(
         "--cdx-output-dir",
         default=None,
         help="If set (S3 --stream mode), write consolidated CDX Parquet part files "
-        "(local or s3://eai-warcs/cdx/<day>/). Rows are buffered per worker and flushed "
-        "into ~--cdx-rows-per-file chunks instead of one tiny file per WARC.",
+        "(local or s3://eai-warcs/cdx/<day>/). Rows are consolidated within each "
+        "deterministic WARC source group.",
     )
     parser.add_argument(
         "--cdx-rows-per-file",
@@ -139,17 +155,14 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.environ.get("EAI_PDF_ROWS_PER_FILE", "2000000")),
         help="Target PDF-index rows per consolidated Parquet part (S3 --stream mode). PDFs "
-        "are rare, so per-worker buffers usually flush once at teardown (one file per worker) "
-        "rather than hitting this. Default 2_000_000 or EAI_PDF_ROWS_PER_FILE.",
+        "are rare, so a source group usually emits at most one PDF part. "
+        "Default 2_000_000 or EAI_PDF_ROWS_PER_FILE.",
     )
     parser.add_argument(
         "--backend",
         choices=_BACKEND_CHOICES,
         default=os.environ.get("EAI_BACKEND", "ray_actor_pool"),
-        help="Ray execution backend. Default 'ray_actor_pool' (or EAI_BACKEND): it is the "
-        "only backend that calls stage teardown(), required to flush the final buffered "
-        "CDX part. 'ray_data' exposes the Ray Data progress tab but drops the tail CDX "
-        "file per worker; 'xenna' is the legacy streaming executor.",
+        help="Ray execution backend. Default 'ray_actor_pool' (or EAI_BACKEND).",
     )
     parser.add_argument(
         "--output-rclone-remote",
@@ -240,6 +253,7 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
                 cdx_output_dir=args.cdx_output_dir,
                 cdx_storage_options=write_opts if args.cdx_output_dir and is_remote_url(args.cdx_output_dir) else None,
                 keys=keys,
+                warcs_per_task=args.warcs_per_task,
                 stream_cpus=args.stream_cpus,
                 cdx_rows_per_file=args.cdx_rows_per_file,
             )
@@ -300,18 +314,23 @@ def _log_ray_dashboard(ray_client: RayClient) -> None:
     )
 
 
-def main() -> int:
+def _code_snapshot_identity() -> dict[str, str]:
+    identity = {"path": str(REPO_ROOT)}
+    info_path = REPO_ROOT / "SNAPSHOT_INFO.txt"
+    if info_path.is_file():
+        for raw in info_path.read_text().splitlines():
+            key, separator, value = raw.partition(":")
+            if separator and key.strip() and value.strip():
+                identity[key.strip()] = value.strip()
+    return identity
+
+
+def main() -> int:  # noqa: PLR0915
     args = parse_args()
 
-    # The streaming stage buffers PDF + CDX rows per worker and flushes the final
-    # partial part in teardown(); only ray_actor_pool invokes teardown. Warn loudly
-    # if the chosen backend would drop those tail parts (silently truncating output).
-    if args.s3_bucket and args.stream and args.backend not in _BACKENDS_WITH_TEARDOWN:
-        logger.warning(
-            f"--backend {args.backend} does not call stage teardown(): each worker's final "
-            f"buffered PDF/CDX part will be DROPPED (up to --pdf-rows-per-file/"
-            f"--cdx-rows-per-file rows each). Use --backend ray_actor_pool for complete output."
-        )
+    if bool(args.checkpoint_path) != bool(args.s3_keys_file):
+        msg = "Resumable streaming requires both --checkpoint-path and --s3-keys-file"
+        raise SystemExit(msg)
 
     # RayClient defaults to /tmp/ray which is often unwritable on shared login nodes.
     # Honor RAY_TMPDIR (set by submit.sh / the day-scale checklist).
@@ -324,19 +343,71 @@ def main() -> int:
     # On SLURM worker nodes (SLURM_NODEID > 0) start() blocks; only the head continues.
     _log_ray_dashboard(ray_client)
 
+    manifest_sha256 = ""
+    manifest_warcs = 0
+    write_opts = None
     try:
+        if args.s3_bucket and args.stream and args.checkpoint_path:
+            manifest_sha256, manifest_warcs = manifest_identity(args.s3_keys_file)
+            write_opts = resolve_output_storage_options(rclone_remote=args.output_rclone_remote)
+            if is_remote_url(args.output_dir) and write_opts is None:
+                msg = (
+                    "Remote output requires --output-rclone-remote or EAI_OUT_AWS_ACCESS_KEY_ID/"
+                    "EAI_OUT_AWS_SECRET_ACCESS_KEY"
+                )
+                raise SystemExit(msg)
+            migrated = initialize_output(
+                checkpoint_path=args.checkpoint_path,
+                manifest_sha256=manifest_sha256,
+                pdf_output_dir=args.output_dir,
+                cdx_output_dir=args.cdx_output_dir,
+                storage_options=write_opts,
+            )
+            logger.info(
+                f"{'Migrated legacy output' if migrated else 'Resuming initialized output'}: "
+                f"manifest={manifest_sha256} WARCs={manifest_warcs}"
+            )
         pipeline = build_pipeline(args)
         logger.info(f"\n{pipeline.describe()}")
         logger.info(f"Executor backend: {args.backend}")
         executor = build_executor(args.backend)
-        results = pipeline.run(executor=executor)
+        results = pipeline.run(executor=executor, checkpoint_path=args.checkpoint_path)
     finally:
         ray_client.stop()
 
-    if args.s3_bucket and args.stream:
+    if args.s3_bucket and args.stream and args.checkpoint_path:
+        from nemo_curator.backends.failed_task_markers import failed_task_manifest_exists
+        from nemo_curator.backends.slurm_array import find_slurm_array_retries
+
+        if failed_task_manifest_exists():
+            msg = "One or more WARC source groups failed; refusing to write _SUCCESS"
+            raise RuntimeError(msg)
+        retry_plan = find_slurm_array_retries(args.checkpoint_path)
+        if retry_plan is None or retry_plan.shard_indices:
+            pending = retry_plan.shard_indices if retry_plan else ("unknown",)
+            msg = f"Native resumability reports incomplete shard(s): {pending}; refusing to write _SUCCESS"
+            raise RuntimeError(msg)
+        marker = {
+            "status": "completed",
+            "layout_version": OUTPUT_LAYOUT_VERSION,
+            "manifest_sha256": manifest_sha256,
+            "warc_count": manifest_warcs,
+            "pdf_output_dir": args.output_dir.rstrip("/") + "/",
+            "cdx_output_dir": args.cdx_output_dir.rstrip("/") + "/" if args.cdx_output_dir else None,
+            "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+            "slurm_array_job_id": os.environ.get("SLURM_ARRAY_JOB_ID"),
+            "slurm_array_task_id": os.environ.get("SLURM_ARRAY_TASK_ID"),
+            "code_snapshot": _code_snapshot_identity(),
+            "completed_at": datetime.now(UTC).isoformat(),
+        }
+        marker_path = success_marker_path(args.output_dir)
+        write_json(marker_path, marker, write_opts)
+        logger.info(f"Uploaded authoritative success marker: {marker_path}")
         # Terminal self-writing stage returns no tasks; per-file/row counts are in
         # the per-worker "Flushed N ... row(s)" log lines.
         logger.info("Streaming complete; PDF/CDX parts written by workers (see 'Flushed ...' log lines).")
+    elif args.s3_bucket and args.stream:
+        logger.info("Streaming complete without native checkpointing or an authoritative _SUCCESS marker.")
     else:
         total_records = sum(task.num_items for task in results) if results else 0
         logger.info(f"Collected {total_records} PDF URL(s) across {len(results) if results else 0} output batch(es)")

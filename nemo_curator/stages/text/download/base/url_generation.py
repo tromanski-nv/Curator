@@ -39,9 +39,13 @@ class URLGenerationStage(ProcessingStage[EmptyTask, FileGroupTask]):
 
     url_generator: URLGenerator
     limit: int | None = None
+    urls_per_task: int = 1
     resources = Resources(cpus=0.5)
 
     def __post_init__(self):
+        if self.urls_per_task < 1:
+            msg = f"urls_per_task must be at least 1, got {self.urls_per_task}"
+            raise ValueError(msg)
         self.name = f"url_generation_{self.url_generator.__class__.__name__.lower()}"
 
     def inputs(self) -> tuple[list[str], list[str]]:
@@ -62,7 +66,6 @@ class URLGenerationStage(ProcessingStage[EmptyTask, FileGroupTask]):
             list[FileGroupTask]: List of tasks containing URLs
         """
 
-        # Create one task per URL for better parallelization
         urls = self.url_generator.generate_urls()
         if self.limit is not None:
             urls = urls[: self.limit]
@@ -70,10 +73,11 @@ class URLGenerationStage(ProcessingStage[EmptyTask, FileGroupTask]):
         return [
             FileGroupTask(
                 dataset_name=task.dataset_name,
-                data=[url],
-                _metadata={"source_url": url},
+                data=group,
+                _metadata={"source_url": group[0]} if len(group) == 1 else {"source_urls": list(group)},
             )
-            for i, url in enumerate(urls)
+            for i in range(0, len(urls), self.urls_per_task)
+            if (group := urls[i : i + self.urls_per_task])
         ]
 
     def ray_stage_spec(self) -> dict[str, Any]:
