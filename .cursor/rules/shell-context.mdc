@@ -1,0 +1,41 @@
+---
+description: Use fish syntax for local commands and bash syntax for Slurm-node commands
+alwaysApply: true
+---
+
+# Shell Context: fish locally, bash on Slurm
+
+The user's **local/login shell is fish**. Commands that run **on a Slurm compute
+node** (inside `srun`/`sbatch`/`salloc`, or a job script) run in **bash**. Give
+commands in the syntax matching where they execute.
+
+## Which shell for which command
+
+- **fish (local/login)**: interactive commands run from the login node — e.g.
+  launching jobs (`salloc`, `sbatch`, `srun ... --pty`), `squeue`, `sacct`,
+  `tail -f` on logs, and setting env vars for a submission.
+- **bash (Slurm node)**: anything that executes on an allocated node — job body
+  scripts, `uv run ...` on a compute node, heredocs (`<<'PY'`), and the contents
+  of `submit_*.sh` (these are `#!/bin/bash`).
+
+When a snippet is ambiguous, label it (e.g. "fish (login)" / "bash (node)").
+
+## Syntax differences to get right
+
+| Task | fish (local) | bash (Slurm node) |
+|------|--------------|-------------------|
+| Set env for one command | `env FOO=bar cmd` or `FOO=bar cmd` | `FOO=bar cmd` |
+| Export a var | `set -x FOO bar` | `export FOO=bar` |
+| Use a var | `$FOO` | `$FOO` (or `${FOO}`) |
+| Command substitution | `(cmd)` | `$(cmd)` |
+| Chain on success | `cmd1; and cmd2` | `cmd1 && cmd2` |
+| Loop | `for x in a b; ...; end` | `for x in a b; do ...; done` |
+
+## Notes
+
+- Prefer `env VAR=val ... bash script.sh` for job launches from fish — it passes
+  vars cleanly without needing `set -x` and works regardless of the caller shell.
+- Heredocs (`<<'PY'`, `<<'EOF'`) are bash constructs; only put them in bash
+  (node) snippets, not fish.
+- Multi-line `\`-continued commands work in both, but fish does not support the
+  bash `export A=1 B=2` one-liner style — use `set -x A 1; set -x B 2`.
