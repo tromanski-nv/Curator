@@ -12,23 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Literal
 
 import cudf
 import numpy as np
 import rmm
+from loguru import logger
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.deduplication.fuzzy.utils import CURATOR_DEFAULT_MINHASH_FIELD
 from nemo_curator.stages.deduplication.id_generator import CURATOR_DEDUP_ID_STR, get_id_generator_actor
 from nemo_curator.stages.deduplication.io_utils import DeduplicationIO
+from nemo_curator.stages.interleaved.utils.deduplication import sample_ordering
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import FileGroupTask
 from nemo_curator.utils.file_utils import create_or_overwrite_dir, get_fs
 
 if TYPE_CHECKING:
     from nemo_curator.backends.base import WorkerMetadata
+
+InterleavedTextMode = Literal["metadata_content", "text_rows"]
 
 
 class MinHash(ABC):
@@ -334,6 +339,209 @@ class MinHashStage(ProcessingStage[FileGroupTask, FileGroupTask], DeduplicationI
                 "minhash_field": self.minhash_field,
                 "num_hashes": self.num_hashes,
                 "storage_options": self.write_kwargs.get("storage_options"),
+            },
+            _stage_perf=task._stage_perf,
+        )
+
+
+class InterleavedMinHashStage(MinHashStage):
+    """Compute one MinHash signature per sample in row-wise interleaved Parquet data."""
+
+    def __init__(  # noqa: PLR0913
+        self,
+        output_path: str,
+        text_mode: InterleavedTextMode,
+        text_field: str = "text",
+        minhash_field: str = CURATOR_DEFAULT_MINHASH_FIELD,
+        char_ngrams: int = 24,
+        num_hashes: int = 260,
+        seed: int = 42,
+        use_64bit_hash: bool = False,
+        read_kwargs: dict[str, Any] | None = None,
+        write_kwargs: dict[str, Any] | None = None,
+        sample_id_field: str = "sample_id",
+        position_field: str = "position",
+        modality_field: str = "modality",
+        text_content_field: str = "text_content",
+        text_modality: str = "text",
+        metadata_modality: str = "metadata",
+        metadata_json_path: str | None = "$.content",
+        text_separator: str = "\n\n",
+        pool: bool = True,
+    ):
+        if text_mode not in ("metadata_content", "text_rows"):
+            msg = "text_mode must be one of {'metadata_content', 'text_rows'}"
+            raise ValueError(msg)
+
+        super().__init__(
+            output_path=output_path,
+            text_field=text_field,
+            minhash_field=minhash_field,
+            char_ngrams=char_ngrams,
+            num_hashes=num_hashes,
+            seed=seed,
+            use_64bit_hash=use_64bit_hash,
+            read_format="parquet",
+            read_kwargs=read_kwargs,
+            write_kwargs=write_kwargs,
+            pool=pool,
+        )
+        self.text_mode = text_mode
+        self.sample_id_field = sample_id_field
+        self.position_field = position_field
+        self.modality_field = modality_field
+        self.text_content_field = text_content_field
+        self.text_modality = text_modality
+        self.metadata_modality = metadata_modality
+        self.metadata_json_path = metadata_json_path
+        self.text_separator = text_separator
+
+    def _read_interleaved(self, filepaths: list[str]) -> cudf.DataFrame:
+        read_kwargs = self.read_kwargs.copy()
+        columns_override = read_kwargs.pop("columns", None)
+        if columns_override is not None:
+            msg = "Columns cannot be set in read_kwargs for InterleavedMinHashStage"
+            raise ValueError(msg)
+
+        columns = [self.sample_id_field, self.modality_field, self.text_content_field]
+        if self.text_mode == "text_rows":
+            columns.append(self.position_field)
+        return self.read_parquet(filepath=filepaths, columns=columns, assign_id=False, **read_kwargs)
+
+    def _extract_metadata_content(self, df: cudf.DataFrame) -> cudf.DataFrame:
+        df = df[df[self.modality_field] == self.metadata_modality][[self.sample_id_field, self.text_content_field]]
+        row_count_field = "_metadata_row_count"
+        df[row_count_field] = 1
+        row_counts = df.groupby(self.sample_id_field, sort=True).agg({row_count_field: "sum"}).reset_index()
+        duplicate_metadata_samples = row_counts[row_counts[row_count_field] > 1]
+        if len(duplicate_metadata_samples) > 0:
+            duplicate_sample_ids = duplicate_metadata_samples[self.sample_id_field].head().to_arrow().to_pylist()
+            msg = (
+                "Found samples with more than one metadata row while using text_mode='metadata_content'. "
+                f"Example sample_ids: {duplicate_sample_ids}"
+            )
+            raise ValueError(msg)
+
+        if len(df) == 0:
+            return cudf.DataFrame(
+                {
+                    self.sample_id_field: cudf.Series([], dtype=df[self.sample_id_field].dtype),
+                    self.text_field: cudf.Series([], dtype="str"),
+                },
+            )
+        if self.metadata_json_path is None:
+            df[self.text_field] = df[self.text_content_field]
+        else:
+            df[self.text_field] = df[self.text_content_field].str.get_json_object(self.metadata_json_path)
+        return df[[self.sample_id_field, self.text_field]]
+
+    def _extract_text_rows(self, df: cudf.DataFrame) -> cudf.DataFrame:
+        df = df[df[self.modality_field] == self.text_modality][
+            [self.sample_id_field, self.position_field, self.text_content_field]
+        ]
+        df = df[df[self.text_content_field].notnull()]
+        if len(df) == 0:
+            return cudf.DataFrame(
+                {
+                    self.sample_id_field: cudf.Series([], dtype=df[self.sample_id_field].dtype),
+                    self.text_field: cudf.Series([], dtype="str"),
+                },
+            )
+
+        df = df.sort_values([self.sample_id_field, self.position_field])
+        df = df.groupby(self.sample_id_field, sort=True).agg({self.text_content_field: list})
+        df[self.text_field] = df[self.text_content_field].str.join(self.text_separator)
+        return df.reset_index()[[self.sample_id_field, self.text_field]]
+
+    def sample_ordering(self, df: cudf.DataFrame) -> cudf.Series:
+        """Return sample IDs in the same order used by the removal reader."""
+        return sample_ordering(df, self.sample_id_field)
+
+    def _extract_documents_with_metrics(self, df: cudf.DataFrame) -> tuple[cudf.DataFrame, dict[str, float]]:
+        metrics: dict[str, float] = {}
+
+        started = time.perf_counter()
+        documents = self.sample_ordering(df).to_frame(name=self.sample_id_field)
+        metrics["sample_ordering_time"] = time.perf_counter() - started
+        if len(documents) == 0:
+            msg = "No interleaved samples found"
+            raise ValueError(msg)
+
+        started = time.perf_counter()
+        if self.text_mode == "metadata_content":
+            extracted_text = self._extract_metadata_content(df)
+        else:
+            extracted_text = self._extract_text_rows(df)
+        metrics["text_extraction_time"] = time.perf_counter() - started
+        metrics["num_extracted_text_documents"] = float(len(extracted_text))
+
+        started = time.perf_counter()
+        documents = documents.merge(extracted_text, on=self.sample_id_field, how="left")
+        documents = documents.sort_values(self.sample_id_field).reset_index(drop=True)
+        metrics["sample_text_join_time"] = time.perf_counter() - started
+        return documents, metrics
+
+    def _extract_documents(self, df: cudf.DataFrame) -> cudf.DataFrame:
+        documents, _ = self._extract_documents_with_metrics(df)
+        return documents
+
+    def process(self, task: FileGroupTask) -> FileGroupTask:
+        if self.minhash_processor is None or self.id_generator is None:
+            msg = "MinHash processor or ID generator not initialized. Call setup() first."
+            raise RuntimeError(msg)
+
+        task_key = task.task_id or task.get_deterministic_id()
+        output_file = self.output_fs.sep.join([self.output_path, f"{task_key}.parquet"])
+        metrics = {"num_input_files": float(len(task.data))}
+
+        started = time.perf_counter()
+        df = self._read_interleaved(task.data)
+        metrics["read_time"] = time.perf_counter() - started
+        metrics["num_input_rows"] = float(len(df))
+
+        started = time.perf_counter()
+        documents, normalization_metrics = self._extract_documents_with_metrics(df)
+        metrics.update(normalization_metrics)
+        metrics["normalization_time"] = time.perf_counter() - started
+        metrics["num_documents"] = float(len(documents))
+
+        started = time.perf_counter()
+        documents = self.assign_id(task.data, documents)
+        metrics["assign_id_time"] = time.perf_counter() - started
+
+        hashable_documents = documents[documents[self.text_field].notnull()]
+        metrics["num_hashable_documents"] = float(len(hashable_documents))
+        metrics["num_skipped_documents"] = metrics["num_documents"] - metrics["num_hashable_documents"]
+
+        result_df = hashable_documents[[CURATOR_DEDUP_ID_STR]]
+        started = time.perf_counter()
+        result_df[self.minhash_field] = self.minhash_processor.compute_minhashes(hashable_documents[self.text_field])
+        metrics["minhash_time"] = time.perf_counter() - started
+
+        started = time.perf_counter()
+        self.write_parquet(df=result_df, filepath=output_file, **self.write_kwargs)
+        metrics["write_time"] = time.perf_counter() - started
+
+        logger.debug(
+            "Interleaved MinHash task={} rows={} samples={} hashable={} metrics={}",
+            task.task_id,
+            int(metrics["num_input_rows"]),
+            int(metrics["num_documents"]),
+            int(metrics["num_hashable_documents"]),
+            metrics,
+        )
+        return FileGroupTask(
+            dataset_name=f"{task.dataset_name}_interleaved_minhash",
+            data=[output_file],
+            _metadata={
+                **task._metadata,
+                "minhash_field": self.minhash_field,
+                "num_hashes": self.num_hashes,
+                "storage_options": self.write_kwargs.get("storage_options"),
+                "text_mode": self.text_mode,
+                "num_documents": len(documents),
+                "num_hashable_documents": len(hashable_documents),
+                "interleaved_minhash_metrics": metrics,
             },
             _stage_perf=task._stage_perf,
         )
