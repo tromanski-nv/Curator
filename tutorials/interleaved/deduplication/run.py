@@ -17,10 +17,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import subprocess
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -84,6 +86,39 @@ def _write_manifest(args: argparse.Namespace, metadata: dict[str, Any], tasks: l
 
 def _ray_data_executor(args: argparse.Namespace) -> RayDataExecutor:
     return RayDataExecutor(ignore_head_node=args.ignore_head_node)
+
+
+@contextlib.contextmanager
+def _persistent_ray_cluster() -> Iterator[None]:
+    """Start a persistent Ray cluster for the duration of a GPU dedup workflow.
+
+    The exact/fuzzy workflows create a *detached* ID-generator actor and then
+    call ``ray.shutdown()`` from the driver. A detached actor only survives that
+    shutdown when Ray is a standalone cluster (a separate ``ray start`` process),
+    not a driver-local instance spun up by a bare ``ray.init()``. Without this,
+    the executor's later ``ray.init()`` reconnects to nothing and the setup fails
+    with "Did not find a valid ID generator actor".
+
+    ``RayClient``/``SlurmRayClient`` start such a cluster and export
+    ``RAY_ADDRESS``, so every subsequent ``ray.init()`` (in the workflow and the
+    executor) attaches to the same long-lived cluster. If ``RAY_ADDRESS`` is
+    already set (e.g. an externally managed cluster) the client attaches to it
+    and leaves it running.
+    """
+    from nemo_curator.core.client import RayClient, SlurmRayClient
+
+    client_kwargs: dict[str, Any] = {"include_dashboard": False}
+    ray_temp_dir = os.environ.get("RAY_TMPDIR")
+    if ray_temp_dir:
+        client_kwargs["ray_temp_dir"] = ray_temp_dir
+
+    client_cls = SlurmRayClient if os.environ.get("SLURM_JOB_ID") else RayClient
+    client = client_cls(**client_kwargs)
+    client.start()
+    try:
+        yield
+    finally:
+        client.stop()
 
 
 def _partitioning_kwargs(args: argparse.Namespace) -> dict[str, Any]:
@@ -193,7 +228,8 @@ def run_exact_identification(args: argparse.Namespace) -> None:
         rmm_pool_size=args.rmm_pool_size,
         spill_memory_limit=args.spill_memory_limit,
     )
-    result = workflow.run(executor=RayActorPoolExecutor(ignore_head_node=args.ignore_head_node))
+    with _persistent_ray_cluster():
+        result = workflow.run(executor=RayActorPoolExecutor(ignore_head_node=args.ignore_head_node))
     _write_manifest(args, result.metadata, result.pipeline_tasks.get("identification"))
 
 
@@ -220,7 +256,8 @@ def run_fuzzy_identification(args: argparse.Namespace) -> None:
         lsh_rmm_pool_size=args.rmm_pool_size,
         lsh_spill_memory_limit=args.spill_memory_limit,
     )
-    result = workflow.run(executor=RayActorPoolExecutor(ignore_head_node=args.ignore_head_node))
+    with _persistent_ray_cluster():
+        result = workflow.run(executor=RayActorPoolExecutor(ignore_head_node=args.ignore_head_node))
     output_tasks = result.pipeline_tasks.get("connected_components") or result.pipeline_tasks.get("lsh")
     minhash_tasks = result.pipeline_tasks.get("minhash") or []
     metadata = {
@@ -247,7 +284,10 @@ def run_generated_id_removal(args: argparse.Namespace) -> None:
         output_mode="ignore",
         materialize_on_write=False,
     )
-    result: WorkflowRunResult = workflow.run(executor=_ray_data_executor(args))
+    # The removal workflow loads the ID generator into a detached actor, so it needs the
+    # same persistent Ray cluster as the identification workflows (see _persistent_ray_cluster).
+    with _persistent_ray_cluster():
+        result: WorkflowRunResult = workflow.run(executor=_ray_data_executor(args))
     tasks = result.pipeline_tasks.get("removal")
     metadata = {
         **result.metadata,
