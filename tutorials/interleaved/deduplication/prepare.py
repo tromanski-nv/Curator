@@ -15,6 +15,7 @@
 """Prepare auditable sample, arXiv-version, and PDF-SHA deduplication artifacts."""
 
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -409,6 +410,27 @@ def select_sha_duplicates(args: argparse.Namespace) -> None:
     _write_json(manifest, args.manifest_path)
 
 
+def _read_removal_counts(path_or_pattern: str) -> dict[str, int]:
+    """Read removal-stage sample counts, aggregating per-shard array manifests.
+
+    A single Ray job writes one removal manifest, but the Slurm-array removal
+    writes one manifest per shard (``*.shard-<i>-of-<n>.json``). Accept either a
+    single file path or a glob pattern; when multiple shard manifests match, sum
+    their sample counts so accounting sees one set of stage totals.
+    """
+    matches = sorted(glob.glob(path_or_pattern))
+    if not matches:
+        msg = f"No removal manifest found matching {path_or_pattern!r}"
+        raise FileNotFoundError(msg)
+    totals = {"num_samples_in": 0, "num_samples_removed": 0, "num_samples_out": 0}
+    for match in matches:
+        payload = json.loads(Path(match).read_text())
+        metadata = payload.get("metadata", payload)
+        for key in totals:
+            totals[key] += int(metadata.get(key, 0))
+    return totals
+
+
 def validate_accounting(args: argparse.Namespace) -> None:
     def read_manifest(path: str) -> dict[str, Any]:
         return json.loads(Path(path).read_text())
@@ -424,10 +446,8 @@ def validate_accounting(args: argparse.Namespace) -> None:
         }
     )
     sha = read_manifest(args.sha_manifest)
-    exact = read_manifest(args.exact_removal_manifest)
-    fuzzy = read_manifest(args.fuzzy_removal_manifest)
-    exact_counts = exact.get("metadata", exact)
-    fuzzy_counts = fuzzy.get("metadata", fuzzy)
+    exact_counts = _read_removal_counts(args.exact_removal_manifest)
+    fuzzy_counts = _read_removal_counts(args.fuzzy_removal_manifest)
 
     counts = {
         "raw": int(baseline["num_unique_samples"]),
