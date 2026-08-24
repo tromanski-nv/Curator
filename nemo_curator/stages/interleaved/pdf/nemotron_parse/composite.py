@@ -19,13 +19,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
-from nemo_curator.stages.interleaved.pdf.nemotron_parse.inference import (
-    DEFAULT_MODEL_PATH,
-    NemotronParseInferenceStage,
-)
+from nemo_curator.stages.interleaved.pdf.nemotron_parse.inference import NemotronParseInferenceStage
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.partitioning import PDFPartitioningStage
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.postprocess import NemotronParsePostprocessStage
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.preprocess import PDFPreprocessStage
+from nemo_curator.stages.interleaved.pdf.nemotron_parse.versions import resolve as resolve_profile
 from nemo_curator.tasks import EmptyTask, InterleavedBatch
 
 
@@ -51,7 +49,13 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
     jsonl_base_dir
         Root directory for JSONL-based PDF datasets (e.g. GitHub PDFs).
     model_path
-        HuggingFace model ID or local path.
+        HuggingFace model ID or local path.  ``None`` takes the weights the
+        resolved release profile names.
+    parse_version
+        Which Nemotron-Parse release's behaviour to assume, e.g. ``"v1.2"``.
+        ``None`` recognises it from ``model_path``.  Swapping a release that
+        keeps the same output contract is this argument plus ``model_path``;
+        see :mod:`~nemo_curator.stages.interleaved.pdf.nemotron_parse.versions`.
     backend
         Inference backend: ``"vllm"`` (recommended) or ``"hf"``.
     pdfs_per_task
@@ -84,7 +88,7 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
     zip_base_dir: str | None = None
     pdf_dir: str | None = None
     jsonl_base_dir: str | None = None
-    model_path: str = DEFAULT_MODEL_PATH
+    model_path: str | None = None
     backend: str = "vllm"
     pdfs_per_task: int = 10
     max_pdfs: int | None = None
@@ -99,6 +103,10 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
     file_name_field: str = "file_name"
     file_names_field: str = "cc_pdf_file_names"
     url_field: str = "url"
+    # Appended, not slotted in beside model_path -- see the note on the same
+    # field in NemotronParseInferenceStage.
+    parse_version: str | None = None
+    name: str = "nemotron_parse_pdf_reader"
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -123,6 +131,7 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
         )
         self._inference = NemotronParseInferenceStage(
             model_path=self.model_path,
+            parse_version=self.parse_version,
             text_in_pic=self.text_in_pic,
             backend=self.backend,
             inference_batch_size=self.inference_batch_size,
@@ -131,6 +140,10 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
         )
         self._postprocessor = NemotronParsePostprocessStage(
             min_crop_px=self.min_crop_px,
+            # Resolved here, in the driver, so a profile registered at runtime
+            # reaches the worker with the stage rather than being looked up
+            # again in a process that never saw it.
+            profile=resolve_profile(self.parse_version, self.model_path),
         )
 
     def inputs(self) -> tuple[list[str], list[str]]:

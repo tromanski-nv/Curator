@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU postprocess stage: parse model output, align images, build interleaved rows."""
+"""CPU postprocess stage: parse model output, align images, build interleaved rows.
+
+This is the last stage of the *parse* phase -- it decodes the model's raw
+output string into one row per element.  The rules that turn those elements
+into a document live next door in
+:mod:`~nemo_curator.stages.interleaved.pdf.nemotron_parse.postprocessing`,
+which reads what this module writes.
+"""
 
 from __future__ import annotations
 
@@ -25,6 +32,7 @@ import pyarrow as pa
 from PIL import Image
 
 from nemo_curator.stages.base import ProcessingStage
+from nemo_curator.stages.interleaved.pdf.nemotron_parse import versions
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.utils import (
     DEFAULT_MIN_CROP_PX,
     build_interleaved_rows,
@@ -42,12 +50,20 @@ class NemotronParsePostprocessStage(ProcessingStage[InterleavedBatch, Interleave
     from ``text_content``, then constructs one row per element (text, image,
     table, metadata) in the interleaved schema.
 
-    Floater reordering (Pictures/Captions) is applied automatically for
-    Nemotron-Parse v1.1 and skipped for v1.2+, based on the ``model_path``
-    stored in task metadata by the inference stage.
+    Floater reordering (Pictures/Captions) is applied for releases that emit
+    them at the end of the page rather than in reading order -- v1.1 does,
+    v1.2 and later do not.  Which is which is read off the release profile,
+    not sniffed out of the model path here.
 
     Parameters
     ----------
+    profile
+        The Nemotron-Parse release being run.  Set by the composite, which
+        resolves it once in the driver.  Left ``None`` the profile is recovered
+        from task metadata instead -- correct for the releases this repo knows
+        about, but a profile added at runtime by
+        :func:`~.versions.register_profile` exists only in the process that
+        registered it, so a stage constructed without one would not see it.
     proc_size
         Default model processor size ``(height, width)``.  Overridden at
         runtime by ``task._metadata["proc_size"]`` when available.
@@ -58,6 +74,7 @@ class NemotronParsePostprocessStage(ProcessingStage[InterleavedBatch, Interleave
 
     proc_size: tuple[int, int] = (2048, 1664)
     min_crop_px: int = DEFAULT_MIN_CROP_PX
+    profile: versions.NemotronParseProfile | None = None
     name: str = "nemotron_parse_postprocess"
     resources: Resources = field(default_factory=lambda: Resources(cpus=2.0))
 
@@ -70,8 +87,10 @@ class NemotronParsePostprocessStage(ProcessingStage[InterleavedBatch, Interleave
     def process(self, task: InterleavedBatch) -> InterleavedBatch | None:
         pages = task.to_pandas()
         proc_size = tuple(task._metadata.get("proc_size", self.proc_size))
-        model_path = task._metadata.get("model_path", "")
-        reorder = "v1.1" in model_path
+        profile = self.profile or versions.resolve(
+            task._metadata.get("parse_version"), task._metadata.get("model_path")
+        )
+        reorder = not profile.floats_in_reading_order
 
         all_rows: list[dict[str, Any]] = []
         for sample_id, sample_group in pages.groupby("sample_id", sort=False):

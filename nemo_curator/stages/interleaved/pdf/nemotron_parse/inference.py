@@ -28,17 +28,19 @@ from loguru import logger
 from PIL import Image
 
 from nemo_curator.stages.base import ProcessingStage
+from nemo_curator.stages.interleaved.pdf.nemotron_parse import versions
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import InterleavedBatch
 
-DEFAULT_MODEL_PATH = "nvidia/NVIDIA-Nemotron-Parse-v1.2"
-PROMPT_BASE = "</s><s><predict_bbox><predict_classes><output_markdown>"
+#: Kept as module-level names because callers import them.  What each release
+#: actually needs now lives on a :class:`~.versions.NemotronParseProfile`.
+DEFAULT_MODEL_PATH = versions.DEFAULT_PROFILE.resolved_model_path()
+PROMPT_BASE = versions.PROMPT_BASE
 
 
 def build_task_prompt(*, text_in_pic: bool = False) -> str:
     """Build the Nemotron-Parse task prompt with the appropriate text-in-pic token."""
-    suffix = "<predict_text_in_pic>" if text_in_pic else "<predict_no_text_in_pic>"
-    return f"{PROMPT_BASE}{suffix}"
+    return versions.DEFAULT_PROFILE.task_prompt(text_in_pic=text_in_pic)
 
 
 @dataclass
@@ -59,6 +61,16 @@ class NemotronParseInferenceStage(ProcessingStage[InterleavedBatch, InterleavedB
     ----------
     model_path
         HuggingFace model ID or local path (e.g. ``nvidia/NVIDIA-Nemotron-Parse-v1.2``).
+        ``None`` -- the default -- takes the weights the resolved release
+        profile names, so ``parse_version`` alone is enough to change release.
+        Defaulting this to a concrete path would mean naming a version and
+        silently loading a different version's weights.
+    parse_version
+        Which release's behaviour to assume, e.g. ``"v1.2"``.  When ``None`` it
+        is recognised from ``model_path``.  See
+        :mod:`~nemo_curator.stages.interleaved.pdf.nemotron_parse.versions` --
+        that module, not a version string scattered through these stages, is
+        what makes swapping a release a one-argument change.
     text_in_pic
         Whether to predict text inside pictures. When ``True``, uses the
         ``<predict_text_in_pic>`` prompt token; when ``False`` (default), uses
@@ -76,7 +88,7 @@ class NemotronParseInferenceStage(ProcessingStage[InterleavedBatch, InterleavedB
         ``gpu_memory_utilization``, ``max_num_batched_tokens``). vLLM backend only.
     """
 
-    model_path: str = DEFAULT_MODEL_PATH
+    model_path: str | None = None
     text_in_pic: bool = False
     task_prompt: str | None = None
     backend: str = "vllm"
@@ -84,12 +96,18 @@ class NemotronParseInferenceStage(ProcessingStage[InterleavedBatch, InterleavedB
     max_num_seqs: int = 64
     enforce_eager: bool = False
     engine_kwargs: dict[str, Any] | None = None
+    # Appended rather than slotted in beside model_path: dataclass field order
+    # is positional-argument order, and anyone constructing this stage
+    # positionally would silently get a different stage.
+    parse_version: str | None = None
     name: str = "nemotron_parse_inference"
     resources: Resources = field(default_factory=lambda: Resources(cpus=4.0, gpus=1.0))
 
     def __post_init__(self) -> None:
+        self.profile = versions.resolve(self.parse_version, self.model_path)
+        self.model_path = self.profile.resolved_model_path(self.model_path)
         if self.task_prompt is None:
-            self.task_prompt = build_task_prompt(text_in_pic=self.text_in_pic)
+            self.task_prompt = self.profile.task_prompt(text_in_pic=self.text_in_pic)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
@@ -344,6 +362,7 @@ class NemotronParseInferenceStage(ProcessingStage[InterleavedBatch, InterleavedB
         metadata = dict(task._metadata)
         metadata["proc_size"] = list(self._proc_size)
         metadata["model_path"] = self.model_path
+        metadata["parse_version"] = self.profile.name
 
         return InterleavedBatch(
             dataset_name=task.dataset_name,
