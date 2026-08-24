@@ -18,7 +18,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from nemo_curator.pipeline.pipeline import Pipeline, assign_root_task_ids
-from nemo_curator.stages.base import ProcessingStage, StageInputSpecs
+from nemo_curator.stages.base import CompositeStage, ProcessingStage, StageInputSpecs
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import EmptyTask, Task
 
@@ -35,6 +35,20 @@ class _NoopStage(ProcessingStage[Task, Task]):
 
     def process(self, task: Task) -> Task:
         return task
+
+
+@dataclass
+class _Composite(CompositeStage[Task, Task]):
+    """A composite whose width is a parameter, so one stage is testable."""
+
+    width: int = 2
+    name: str = "composite"
+
+    def __post_init__(self) -> None:
+        super().__init__()
+
+    def decompose(self) -> list[ProcessingStage]:
+        return [_NoopStage(name=f"child{i}") for i in range(self.width)]
 
 
 @dataclass
@@ -182,6 +196,41 @@ class TestPipelineBuild:
         t1.is_sink_stage = True
         with pytest.raises(ValueError, match="multiple sink stages marked"):
             Pipeline(name="t", stages=[t0, t1]).build()
+
+
+class TestCompositeDecomposition:
+    """``build`` must leave no composite in the execution plan.
+
+    A ``CompositeStage`` that survives planning raises from ``process()`` at
+    run time, so the failure lands after the cluster is up and the data is
+    read -- which is the worst possible moment to learn about it.
+    """
+
+    def test_a_composite_of_several_stages_is_expanded(self) -> None:
+        pipeline = Pipeline(name="t", stages=[_Composite(width=3)])
+
+        pipeline.build()
+
+        assert [s.name for s in pipeline.stages] == ["child0", "child1", "child2"]
+        assert pipeline.decomposition_info["composite"] == ["child0", "child1", "child2"]
+
+    def test_a_composite_of_one_stage_is_expanded_too(self) -> None:
+        """A fused variant of a multi-stage composite decomposes to exactly
+        one stage, and used to be left in the plan as itself."""
+        pipeline = Pipeline(name="t", stages=[_Composite(width=1)])
+
+        pipeline.build()
+
+        assert [type(s) for s in pipeline.stages] == [_NoopStage]
+        assert [s.name for s in pipeline.stages] == ["child0"]
+        assert pipeline.decomposition_info["composite"] == ["child0"]
+
+    def test_no_composite_survives_planning(self) -> None:
+        pipeline = Pipeline(name="t", stages=[_Composite(width=1), _NoopStage(name="plain"), _Composite(width=2)])
+
+        pipeline.build()
+
+        assert not [s for s in pipeline.stages if isinstance(s, CompositeStage)]
 
 
 class TestRootTaskIds:

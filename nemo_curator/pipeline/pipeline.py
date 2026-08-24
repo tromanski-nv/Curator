@@ -197,8 +197,13 @@ class Pipeline:
                 decomposition_info[stage.name] = [s.name for s in sub_stages]
                 logger.info(f"Expanded '{stage.name}' into {len(sub_stages)} execution stages")
             else:
-                # Regular stage, add as-is
-                execution_stages.append(stage)
+                # A composite may legitimately decompose to a single stage --
+                # a fused variant of a multi-stage one, say.  Take what it
+                # decomposed into, not the composite: a CompositeStage left in
+                # the plan raises from process() at run time.
+                execution_stages.append(sub_stages[0] if isinstance(stage, CompositeStage) else stage)
+                if isinstance(stage, CompositeStage):
+                    decomposition_info[stage.name] = [sub_stages[0].name]
 
         return execution_stages, decomposition_info
 
