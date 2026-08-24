@@ -21,8 +21,16 @@ paragraph; the page number is a box like any other; the bibliography reads as
 prose.  This package applies the rules that turn the one into the other, and
 writes the result as markdown in the interleaved schema.
 
-Pure functions that know nothing about Curator, so they can be run on a list of
-dataclasses in a notebook::
+Two ways in.  The pipeline stage::
+
+    from nemo_curator.stages.interleaved.pdf.nemotron_parse.postprocessing import (
+        Config, NemotronParseMarkdownPostprocessor,
+    )
+
+    pipeline.add_stage(NemotronParseMarkdownPostprocessor(config=Config()))
+
+and the pure functions underneath it, which know nothing about Curator and can
+be run on a list of dataclasses in a notebook::
 
     from nemo_curator.stages.interleaved.pdf.nemotron_parse.postprocessing import (
         Element, postprocess, to_markdown,
@@ -44,6 +52,9 @@ triggered by page-F1 failure and by runs of unparseable ``Bad-box`` output,
 neither of which a model that emits structured elements produces.
 """
 
+from nemo_curator.stages.interleaved.pdf.nemotron_parse.postprocessing.composite import (
+    NemotronParseMarkdownPostprocessor,
+)
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.postprocessing.markdown import (
     RENDERERS,
     render,
@@ -61,6 +72,15 @@ from nemo_curator.stages.interleaved.pdf.nemotron_parse.postprocessing.model imp
     Page,
     ProcessedDocument,
     Stats,
+)
+from nemo_curator.stages.interleaved.pdf.nemotron_parse.postprocessing.stages import (
+    ElementCleaningStage,
+    FloatAssignmentStage,
+    FusedPostprocessingStage,
+    MarkdownAssemblyStage,
+    PageFurnitureStage,
+    ParagraphReconstitutionStage,
+    SectionSkippingStage,
 )
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.postprocessing.steps import (
     assemble,
@@ -87,9 +107,17 @@ __all__ = [
     "Box",
     "Config",
     "Element",
+    "ElementCleaningStage",
+    "FloatAssignmentStage",
+    "FusedPostprocessingStage",
     "Layout",
+    "MarkdownAssemblyStage",
+    "NemotronParseMarkdownPostprocessor",
     "Page",
+    "PageFurnitureStage",
+    "ParagraphReconstitutionStage",
     "ProcessedDocument",
+    "SectionSkippingStage",
     "Stats",
     "assemble",
     "assign_floats",
