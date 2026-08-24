@@ -285,6 +285,9 @@ navigation:
                   - page: Interleaved Filters
                     path: ./v26.04/pages/curate-text/process-data/interleaved/filters.mdx
                     slug: filters
+                  - page: PDF to Interleaved Markdown
+                    path: ./v26.04/pages/curate-text/process-data/interleaved/pdf-markdown.mdx
+                    slug: pdf-markdown
           - page: Save and Export
             path: ./v26.04/pages/curate-text/save-export.mdx
             slug: save-export

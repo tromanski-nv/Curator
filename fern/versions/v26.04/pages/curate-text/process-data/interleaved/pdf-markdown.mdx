@@ -1,0 +1,202 @@
+---
+description: "Turn PDFs into interleaved markdown with Nemotron-Parse: parse pages into elements, then reassemble them into a readable document with paragraphs rejoined, figures beside their captions, and page furniture dropped"
+categories: ["text-curation"]
+tags: ["interleaved", "pdf", "nemotron-parse", "markdown", "postprocessing", "ocr"]
+personas: ["data-scientist-focused", "mle-focused"]
+difficulty: "intermediate"
+content_type: "how-to"
+modality: "universal"
+---
+
+# PDF to Interleaved Markdown
+
+Nemotron-Parse tells you what is on each page. It does not tell you what the document *says*: a sentence is cut in half by a column break, a figure sits in the middle of a paragraph, the page number is a box like any other, and the bibliography reads as prose. This page covers the two stages that close that gap.
+
+```text
+PDFs ──▶ NemotronParsePDFReader ──▶ elements ──▶ NemotronParseMarkdownPostprocessor ──▶ interleaved markdown
+              GPU, hours              (parquet)              CPU, minutes                      (parquet)
+```
+
+## Why Two Stages
+
+The split is the point, not an implementation detail.
+
+| | Parse | Post-process |
+|---|---|---|
+| Cost | A GPU-hour per few hundred documents | Milliseconds per document, CPU only |
+| Output | One row per element the model found | One row per markdown block or image |
+| How often you run it | Once | Every time you change your mind about a rule |
+
+Keep the element output. Re-run post-processing against it as often as you like without touching a GPU.
+
+## Parse
+
+`NemotronParsePDFReader` decomposes into four execution stages. It is documented in full under [Nemotron-Parse PDF Pipeline](/curate-text/load-data/nemotron-parse-pdf); what matters here is the shape of what it produces.
+
+```python
+from nemo_curator.pipeline import Pipeline
+from nemo_curator.stages.interleaved.io import InterleavedParquetWriterStage
+from nemo_curator.stages.interleaved.pdf.nemotron_parse import NemotronParsePDFReader
+
+pipeline = Pipeline(name="parse")
+pipeline.add_stage(
+    NemotronParsePDFReader(
+        manifest_path="manifest.jsonl",
+        pdf_dir="/data/pdfs",
+        backend="vllm",
+    )
+)
+pipeline.add_stage(InterleavedParquetWriterStage(path="/data/elements"))
+```
+
+| Stage | Resource | What it does |
+|---|---|---|
+| `pdf_partitioning` | CPU | Read the manifest, pack PDFs into tasks |
+| `pdf_preprocess` | CPU | Extract PDF bytes, render pages to images |
+| `nemotron_parse_inference` | GPU | Run the model |
+| `nemotron_parse_postprocess` | CPU | Decode the raw output into element rows, crop pictures |
+
+Its output is the **Nemotron-Parse element format**: the interleaved schema plus `element_class`, `page_number`, and a `source_ref` holding `{"page": n, "bbox": [x1, y1, x2, y2]}` in normalized coordinates.
+
+<Note>
+The Nemotron-Parse element format stores page geometry in `source_ref`, where the rest of the interleaved schema stores a storage locator (`{path, member, byte_offset, byte_size}`). Readers of this corpus need to know that; readers of any other interleaved corpus do not.
+</Note>
+
+## Post-Process
+
+`NemotronParseMarkdownPostprocessor` decomposes into six execution stages, one per rule it applies:
+
+```python
+from nemo_curator.stages.interleaved.io import InterleavedParquetReader
+from nemo_curator.stages.interleaved.pdf.nemotron_parse import (
+    Config,
+    NemotronParseMarkdownPostprocessor,
+)
+
+pipeline = Pipeline(name="postprocess")
+pipeline.add_stage(InterleavedParquetReader(file_paths="/data/elements", files_per_partition=1))
+pipeline.add_stage(NemotronParseMarkdownPostprocessor(config=Config()))
+pipeline.add_stage(InterleavedParquetWriterStage(path="/data/markdown"))
+```
+
+| Stage | What it decides |
+|---|---|
+| `nemotron_parse_clean` | Condemn what never had content: empty, a Table that lost its `tabular`, a block degenerate with one repeated word |
+| `nemotron_parse_assign_floats` | Lift tables, pictures, captions and footnotes out of the reading flow; match each caption to the figure nearest it |
+| `nemotron_parse_page_furniture` | Condemn running heads and page numbers |
+| `nemotron_parse_skip_sections` | Condemn the contents and the bibliography, from their heading until prose resumes |
+| `nemotron_parse_reconstitute_paragraphs` | Rejoin a sentence broken across a column or a page |
+| `nemotron_parse_markdown` | Flow before floats, written as markdown |
+
+Six stages rather than one so a run can be stopped after any of them and the intermediate written out — which is how you find out *which* rule dropped a paragraph rather than that something did.
+
+`fuse=True` collapses them into a single stage. It produces the identical table; the intermediate is simply no longer observable.
+
+### Nothing Is Deleted
+
+A box that would not reach training is marked `keep=False` with a `drop_reason`, never removed. `emit_dropped=True` keeps those rows in the output so a viewer can show the whole stream and say why each piece was cut.
+
+```python
+NemotronParseMarkdownPostprocessor(emit_dropped=True)
+```
+
+| `drop_reason` | Meaning |
+|---|---|
+| `page-furniture` | A running head or a page number |
+| `toc-bibliography` | Inside a table of contents or a bibliography |
+| `short-caption` | Too short to be a caption; layout noise |
+| `table-without-tabular` | A Table element that lost its `tabular` environment |
+| `repeated-words` | A long block dominated by one repeated word |
+| `joined-into-previous` | Absorbed into the paragraph before it, or orphaned when its continuation was condemned |
+| `dropped-class` | An element class the caller asked to drop |
+| `empty` | No text, and no image payload either |
+
+## What Comes Out
+
+The interleaved schema, plus `element_class`, `page_number`, `source_positions`, `matched_to`, and any passthrough columns. Text rows carry `content_type: text/markdown`; image rows keep their bytes and their own content type, in place in the reading order.
+
+| position | modality | element_class | text_content |
+|---|---|---|---|
+| -1 | metadata | | `{"url": …, "pdf_name": …, "postprocess": {…stats…}}` |
+| 0 | text | Title | `# Casimir Forces on a Quantum Emitter` |
+| 1 | text | Section-header | `## I. INTRODUCTION` |
+| 2 | text | Text | `We propose a model for a quantum emitter interacting with a dispersive object, via $\hat{H}_a$.` |
+| 3 | text | Formula | `$$E_n = \hbar\omega(n + \tfrac{1}{2})$$` |
+| 4 | image | Picture | *(bytes in `binary_content`)* |
+| 5 | text | Caption | `FIG. 1. The emitter sits a distance d above…` |
+
+Row 2 came from two elements — the halves of a sentence broken by a column break — and records both in `source_positions`. Row 5 records which figure claimed it in `matched_to`.
+
+Conventions worth knowing:
+
+- **Tables stay LaTeX.** There is no lossless markdown pipe-table for `\multicolumn` or `\multirow`, which 47% and 23% of them use.
+- **Inline versus display math comes from the element class,** not from the text. The corpus writes `\(…\)` for both; a `Formula` is a block of its own, so it gets `$$…$$` and everything else gets `$…$`.
+- **`\[…\]` is not math.** It is an escaped literal bracket — a citation like `\[28\]` — and appears in 10.7% of Text elements.
+- **Pictures are kept.** Judged by its text alone a picture is empty, and it carries its payload in a column the rules never see. It is never absorbed into the paragraph beside it, and prose still runs on across it. `Config(keep_images=False)` reproduces the older text-only behavior.
+- **A paragraph rejoined across a page boundary has no `bbox`.** It keeps the page it started on and would otherwise carry the bounding box of the fragment that finished it, which is on a different page; `source_ref` reports the geometry as unknown rather than drawing a rectangle on the wrong page.
+
+## Tuning
+
+Every rule can be switched off independently, which is what makes a before/after comparison mean something.
+
+```python
+Config(
+    skip_toc_bib=False,        # keep the contents and the bibliography
+    min_caption_chars=60,      # a looser idea of what counts as a caption
+    drop_classes=frozenset({"Footnote"}),
+)
+```
+
+| Field | Default | Effect |
+|---|---|---|
+| `assign_floats` | `True` | Lift figures and captions out of the reading flow |
+| `reconstitute_paragraphs` | `True` | Rejoin sentences broken across columns and pages |
+| `skip_toc_bib` | `True` | Drop the contents and the bibliography |
+| `drop_page_furniture` | `True` | Drop running heads and page numbers |
+| `require_tabular_in_tables` | `True` | Drop Tables with no `tabular` environment |
+| `check_repeated_words` | `True` | Drop degenerate repeated blocks |
+| `keep_images` | `True` | Keep pictures interleaved with the text |
+| `strip_markdown` | `False` | Reduce markdown to plain text before the rules run |
+| `min_caption_chars` / `min_caption_words` | `100` / `10` | What counts as a caption rather than layout noise |
+| `non_bib_toc_words` | `35` | How much prose ends a bibliography skip |
+| `drop_classes` | `frozenset()` | Element classes to drop outright |
+
+## Changing Model Version
+
+Everything that differs between Nemotron-Parse releases lives on a `NemotronParseProfile`: which weights to load, what prompt to send, and whether the model emits floats in reading order. Moving to a later release that keeps the same output contract is one argument.
+
+```python
+NemotronParsePDFReader(
+    manifest_path="manifest.jsonl",
+    parse_version="v2.0",
+    model_path="nvidia/NVIDIA-Nemotron-Parse-v2.0",
+)
+```
+
+An unregistered version is accepted on your word that the contract is unchanged and logged as such, but it needs `model_path` — guessing a HuggingFace ID is worse than asking for one. If a release *changes* the contract, describe what it actually does and it will supply its own weights:
+
+```python
+from nemo_curator.stages.interleaved.pdf.nemotron_parse import (
+    NemotronParseProfile,
+    register_profile,
+)
+
+register_profile(
+    NemotronParseProfile(
+        name="v2.0",
+        model_path="nvidia/NVIDIA-Nemotron-Parse-v2.0",
+        markers=("v2.0",),
+        floats_in_reading_order=True,
+    )
+)
+```
+
+Post-processing is unaffected either way: it reads element rows, not model output.
+
+## One Constraint
+
+A document must arrive whole — every row of one `sample_id` in one batch. Paragraph reconstitution reaches across pages, so a document split between two batches comes out split. The parse phase emits a document's rows together and the Parquet writer keeps a task's rows in one file, so read that output back with `files_per_partition=1`.
+
+## Reference
+
+A runnable end-to-end script, including running the phases separately, lives in [`tutorials/interleaved/nemotron_parse_markdown/`](https://github.com/NVIDIA-NeMo/Curator/tree/main/tutorials/interleaved/nemotron_parse_markdown).

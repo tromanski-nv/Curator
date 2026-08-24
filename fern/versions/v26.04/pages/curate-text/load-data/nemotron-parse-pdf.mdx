@@ -12,6 +12,8 @@ modality: "universal"
 
 Convert PDF datasets into interleaved Parquet output using NVIDIA's [Nemotron-Parse](https://huggingface.co/nvidia) vision-language model. Unlike traditional text-only PDF parsers, Nemotron-Parse extracts text, images, and reading order in one pass — producing rows directly compatible with the [interleaved dataset](/curate-text/process-data/interleaved) format.
 
+What comes out is one row per element the model found, in roughly reading order — not yet a document. To reassemble those elements into readable markdown, with paragraphs rejoined across columns and pages, figures beside their captions, and page furniture dropped, see [PDF to Interleaved Markdown](/curate-text/process-data/interleaved/pdf-markdown).
+
 ## How it Works
 
 `NemotronParsePDFReader` is a composite stage that expands into four underlying sub-stages:
