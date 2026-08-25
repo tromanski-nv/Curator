@@ -86,6 +86,7 @@ from loguru import logger
 from nemo_curator.backends.xenna import XennaExecutor
 from nemo_curator.core.client import RayClient
 from nemo_curator.pipeline import Pipeline
+from nemo_curator.stages.interleaved.identifiers import AddArxivIdStage
 from nemo_curator.stages.interleaved.io import InterleavedParquetReader, InterleavedParquetWriterStage
 from nemo_curator.stages.interleaved.pdf.nemotron_parse import (
     Config,
@@ -161,7 +162,16 @@ def build_pipeline(args: argparse.Namespace) -> Pipeline:
             )
         )
 
-    # 3. Whatever the last phase produced.
+    # 3. A canonical identifier, for corpora whose sample_id is an arXiv paper.
+    #    sample_id is whatever the producing corpus called the document; this
+    #    is the one spelling the outside world uses, so a join downstream is a
+    #    column comparison rather than a transformation every consumer has to
+    #    remember. Off by default because this pipeline also runs over CC-MAIN
+    #    and GitHub PDFs, whose sample_id is not an arXiv id at all.
+    if args.arxiv_id:
+        pipeline.add_stage(AddArxivIdStage())
+
+    # 4. Whatever the last phase produced.
     pipeline.add_stage(
         InterleavedParquetWriterStage(
             path=args.output_dir,
@@ -462,6 +472,12 @@ if __name__ == "__main__":
     parser.add_argument("--no-require-tabular", action="store_true", help="Keep Tables with no tabular environment")
     parser.add_argument("--text-only", action="store_true", help="Drop pictures instead of interleaving them")
     parser.add_argument("--emit-dropped", action="store_true", help="Keep condemned rows, marked with the reason")
+    parser.add_argument(
+        "--arxiv-id",
+        action="store_true",
+        help="Add a canonical arxiv_id column derived from sample_id. Only meaningful when the "
+        "corpus is arXiv: sample_id must be a paper identifier",
+    )
     parser.add_argument(
         "--fuse",
         action="store_true",
