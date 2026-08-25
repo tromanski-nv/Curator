@@ -377,6 +377,17 @@ def main(args: argparse.Namespace) -> None:
         valid = sum(1 for r in results if r is not None)
         logger.info(f"Pipeline finished in {wall_time:.1f}s, {valid} output tasks ({len(results) - valid} failed)")
         _write_perf_summary(results, args.output_dir, wall_time)
+
+        # The executor runs with ignore_failures=True so that one unreadable
+        # shard cannot take down a corpus run. The cost is that a run in which
+        # *everything* failed looks exactly like a run that succeeded: every
+        # task exits 0, the logs say "0 failed", and nothing was written. Say
+        # so instead, with a non-zero exit, so a Slurm array cannot report
+        # success over an empty output directory.
+        if results and valid == 0:
+            msg = f"every one of the {len(results)} tasks returned nothing -- see the errors above"
+            raise RuntimeError(msg)
+
         write_atlas_manifest(args)
     finally:
         ray_client.stop()

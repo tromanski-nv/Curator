@@ -70,7 +70,15 @@ class AddArxivIdStage(ProcessingStage[InterleavedBatch, InterleavedBatch]):
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        return ["data"], [self.source_column]
+        # No required columns, despite reading `source_column`.
+        # `ProcessingStage.validate_input` checks required columns with
+        # `hasattr(task.data, name)` (stages/base.py:194). That holds for a
+        # pandas-backed task, where `df.sample_id` is an attribute, but
+        # InterleavedBatch carries a pyarrow.Table, which exposes columns only
+        # through `column_names`. Declaring one here therefore fails validation
+        # on every batch, always -- which is why every other interleaved stage
+        # declares none either. `process` checks for the column itself.
+        return ["data"], []
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return ["data"], [self.target_column]
@@ -79,6 +87,12 @@ class AddArxivIdStage(ProcessingStage[InterleavedBatch, InterleavedBatch]):
         table = task.to_pyarrow()
         if table.num_rows == 0:
             return task
+        if self.source_column not in table.column_names:
+            msg = (
+                f"{self.name} needs a {self.source_column!r} column to derive "
+                f"{self.target_column!r} from; the batch has {table.column_names}"
+            )
+            raise ValueError(msg)
 
         # One canon() per distinct document rather than per row: a document is
         # a few hundred rows, and the corpus has ~500 of them per shard.

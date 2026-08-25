@@ -55,11 +55,32 @@ def _run(task: InterleavedBatch, **kwargs: object) -> list[dict[str, Any]]:
 
 
 class TestContract:
-    def test_it_declares_the_columns_it_reads_and_writes(self) -> None:
+    def test_it_declares_no_required_input_column(self) -> None:
+        """Deliberately none.  ``validate_input`` tests required columns with
+        ``hasattr(task.data, name)``, and an InterleavedBatch carries a
+        pyarrow.Table, whose columns are not attributes -- so declaring one
+        fails validation on every batch.  A whole 32-task corpus run was lost
+        to exactly that, silently, because the executor ignores failures."""
         stage = AddArxivIdStage()
 
-        assert stage.inputs() == (["data"], ["sample_id"])
+        assert stage.inputs() == (["data"], [])
         assert stage.outputs() == (["data"], ["arxiv_id"])
+
+    def test_it_passes_its_own_validation(self) -> None:
+        """The regression that motivated the line above: this returned False
+        for every batch, and the run reported success having written nothing."""
+        task = _batch([_row("2410/2410.10730")])
+
+        assert AddArxivIdStage().validate_input(task) is True
+
+    def test_a_missing_source_column_says_so(self) -> None:
+        """Only reachable through ``source_column``: ``sample_id`` is required
+        and non-nullable, and InterleavedBatch validates on construction, so a
+        batch without it cannot be built in the first place."""
+        task = _batch([_row("2410/2410.10730")])
+
+        with pytest.raises(ValueError, match="needs a 'doi' column"):
+            AddArxivIdStage(source_column="doi").process(task)
 
     def test_an_empty_batch_passes_through(self) -> None:
         empty = InterleavedBatch(dataset_name="t", data=pa.Table.from_pylist([], schema=INTERLEAVED_SCHEMA))
