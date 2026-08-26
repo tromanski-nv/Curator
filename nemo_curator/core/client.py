@@ -172,6 +172,22 @@ class RayClient:
                 raise RuntimeError(msg)
 
     def stop(self) -> None:
+        # Disconnect this process before killing the cluster it is talking to.
+        #
+        # Killing the GCS out from under a still-connected driver leaves its
+        # gRPC and raylet clients pointing at a server that is gone. Nothing
+        # fails at the time; the crash lands later, during interpreter
+        # shutdown, as a SIGSEGV in a C extension -- long after the work
+        # succeeded and with nothing in the log to attribute it to. Observed
+        # on 2 of 32 tasks of a Slurm array that had written all of its output
+        # and reported success, where the only symptom was a non-zero exit
+        # code that made `--dependency=afterok` unusable.
+        with contextlib.suppress(Exception):
+            import ray
+
+            if ray.is_initialized():
+                ray.shutdown()
+
         # Remove Ray metrics service discovery entry from prometheus config
         if self.include_dashboard:
             try:
