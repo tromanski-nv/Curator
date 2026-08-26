@@ -133,55 +133,69 @@ pipeline.run()
 
 ## LaTeX Ingestion (arXiv)
 
-Two independent paths convert arXiv bulk source tarballs. They differ in method,
-dependencies and output, and neither subsumes the other. Import from the
-subpackage you want -- `latex.arxiv` re-exports neither, so the choice is
-explicit at every call site.
+Two paths convert arXiv bulk source tarballs, in separate subpackages under
+`latex/arxiv/`. The package re-exports neither, so an import names the path it
+means.
 
-| | `arxiv.latexml` | `arxiv.regex` |
-|---|---|---|
-| Method | Runs `latexmlc`, a full LaTeX processor | Pattern-matches the source directly |
-| Requires | `latexmlc` binary (not a Python package) | Nothing beyond Curator |
-| Output | HTML5 with presentation MathML | Text segments and figure references |
-| Math | MathML, original TeX kept in `alttext` | Placeholders |
-| Macros | Expanded by the TeX engine | Common cases only |
-| Cost | ~44 core-seconds per document | Milliseconds per document |
-| Failure mode | Reports per-document conversion errors | Approximates silently |
-| Emits | Parquet rows of HTML | `InterleavedBatch` |
+### `arxiv.latexml`
 
-Choose on what the downstream task needs: `latexml` when math and document
-structure must survive into the output, `regex` when volume matters more than
-fidelity or when no external binary is available.
+Runs `latexmlc`, a full LaTeX processor, over each submission. Output is HTML5
+with presentation MathML: math is rendered as MathML with the original TeX kept
+in `alttext`, and macros are expanded by the TeX engine. Emits one row per
+submission -- including submissions that produced no HTML, so the denominator
+stays "of all submissions" -- with the grading inputs retained so a change to a
+source-dependent gate can be re-evaluated from Parquet.
+
+Each document costs roughly 44 core-seconds.
 
 ```python
-# regex -- a CompositeStage, drops straight into a pipeline
-from nemo_curator.stages.interleaved.latex.arxiv.regex import ArxivLatexReader
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.stage import ArxivLatexmlReader
 
-pipeline.add_stage(ArxivLatexReader(file_paths="/data/arxiv-src/", papers_per_task=100))
+pipeline.add_stage(ArxivLatexmlReader(file_paths="/data/arxiv-src/", papers_per_task=100))
 ```
+
+To convert a single project without a pipeline:
 
 ```python
-# latexml -- convert one project, outcome reported rather than raised
-from nemo_curator.stages.interleaved.latex.arxiv.latexml.convert import convert
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.document import convert_submission
 
-result = convert(project_dir, root_tex="main.tex", destination=out_html)
-if result.html is not None:
-    ...  # result.argv records the exact invocation for provenance
+doc = convert_submission(payload, member, shard, digest, workdir)
+if doc.converted:
+    ...  # doc.html, doc.tier, doc.status
 ```
 
-### The `latexmlc` dependency
-
-`latexmlc` is a Perl binary, so unlike every other optional dependency in
-Curator it cannot be installed with a pip extra. Obtain it from the public
-ar5iv image, which bundles LaTeXML with the ar5iv bindings:
+Requires the `latexmlc` binary on `PATH`. It is a Perl binary, not a Python
+package, so it cannot be installed with pip. Obtain it from the public ar5iv
+image, which bundles LaTeXML with the ar5iv bindings this path expects:
 
 ```bash
 docker pull latexml/ar5ivist:2512.17     # amd64 only; no aarch64 build exists
 ```
 
-The `latexml` subpackage imports without Ray, pandas or PIL, so it can run
-inside that image against a minimal source tree rather than a full Curator
-install.
+Run the pipeline inside that image, or point `LatexmlConfig(executable=...)` at
+your own build. `LatexmlConvertStage.setup()` checks for the binary once per
+worker, so a missing converter fails the run immediately rather than once per
+document.
+
+### `arxiv.regex`
+
+Pattern-matches the LaTeX source directly, without invoking a LaTeX processor.
+Output is an `InterleavedBatch` whose rows follow the document's reading order
+-- body text, figure, caption, body text -- ready for the interleaved filters
+and writers described above. Math and unrecognised macros become placeholders,
+and common macro definitions are expanded.
+
+Each document costs milliseconds, and the path requires nothing beyond Curator.
+
+```python
+from nemo_curator.stages.interleaved.latex.arxiv.regex import ArxivLatexReader
+
+pipeline.add_stage(ArxivLatexReader(file_paths="/data/arxiv-src/", papers_per_task=100))
+```
+
+Figures are read as stored. Pre-2005 submissions are dominated by PostScript, so
+pass `image_content_types=("image/png", "image/jpeg")` to keep only figures that
+are already raster, or handle conversion downstream.
 
 ## File Layout
 

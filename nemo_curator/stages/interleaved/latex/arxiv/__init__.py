@@ -14,26 +14,22 @@
 
 """Ingestion of arXiv LaTeX source.
 
-Two independent paths convert arXiv bulk source tarballs.  They differ in
-method, dependencies and output shape; neither subsumes the other, and both
-are maintained here side by side.  Import from the subpackage you want --
-this package deliberately re-exports neither, so the choice is explicit at
-every call site.
+Two paths convert arXiv bulk source tarballs, in separate subpackages.  This
+package re-exports neither, so an import names the path it means.
 
 ``latexml``
     Runs ``latexmlc``, a full LaTeX processor, over each submission and emits
     HTML5 with presentation MathML.  Math is rendered as MathML with the
-    original TeX preserved in ``alttext``; macros are expanded by the TeX
-    engine.  Requires the ``latexmlc`` binary, which is not a Python package
-    and is not installed by pip -- see the tutorial for the container image.
-    Costs roughly 44 core-seconds per document.
+    original TeX kept in ``alttext``; macros are expanded by the TeX engine.
+    Every submission produces a row, including those that produced no HTML, so
+    the denominator stays "of all submissions".  Requires the ``latexmlc``
+    binary, which is not a Python package and is not installed by pip; see the
+    package README for the container image.
 
 ``regex``
-    Pattern-matches the LaTeX source directly and emits text segments with
-    figure references.  Math and unrecognised macros become placeholders.
-    Requires nothing beyond Curator, and runs in milliseconds per document.
-
-Choose on what the downstream task needs: ``latexml`` when math and document
-structure must survive, ``regex`` when volume matters more than fidelity or
-when no external binary is available.
+    Pattern-matches the LaTeX source directly, without invoking a LaTeX
+    processor, and emits an :class:`~nemo_curator.tasks.InterleavedBatch` whose
+    rows follow the document's reading order -- body text, figure, caption,
+    body text.  Math and unrecognised macros become placeholders.  Requires
+    nothing beyond Curator.
 """
