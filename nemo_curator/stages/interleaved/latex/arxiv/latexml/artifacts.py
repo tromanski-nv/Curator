@@ -40,7 +40,8 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from dataclasses import dataclass, field
+
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.model import ArtifactReport
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b.*?</\1>", re.DOTALL | re.IGNORECASE)
@@ -66,42 +67,6 @@ _NAMED_ARTIFACTS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("env", re.compile(r"\\begin\b|\\end\b|\\item\b")),
     ("size", re.compile(r"\\small\b|\\large\b|\\Large\b|\\footnotesize\b|\\tiny\b")),
 )
-
-#: Below this share of the document's characters, residual markup is noise
-#: rather than a structural failure.
-ARTIFACT_RATE_WARN = 0.0005
-
-
-@dataclass
-class ArtifactReport:
-    """Residual-LaTeX findings for one converted document."""
-
-    text_chars: int = 0
-    total: int = 0
-    by_kind: dict[str, int] = field(default_factory=dict)
-    top_sequences: list[tuple[str, int]] = field(default_factory=list)
-    unresolved_refs: int = 0
-    samples: list[str] = field(default_factory=list)
-    """Short excerpts showing each artifact in context, for eyeballing."""
-
-    @property
-    def rate(self) -> float:
-        """Artifacts per character of rendered text."""
-        return self.total / self.text_chars if self.text_chars else 0.0
-
-    @property
-    def structural(self) -> int:
-        """Artifacts that indicate a broken construct rather than stray spacing.
-
-        A leaked ``\\ref`` in an author list is a defect at any document size,
-        so these are counted regardless of rate -- unlike ``\\hbox``/``\\kern``
-        noise, which only matters in volume.
-        """
-        return sum(self.by_kind.get(k, 0) for k in ("ref", "cite", "mail", "affil", "graphics", "env"))
-
-    @property
-    def notable(self) -> bool:
-        return self.structural > 0 or (self.total > 0 and self.rate >= ARTIFACT_RATE_WARN)
 
 
 def rendered_text(html: str) -> str:

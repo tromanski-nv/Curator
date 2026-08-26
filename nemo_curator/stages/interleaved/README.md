@@ -131,6 +131,58 @@ pipeline.add_stage(InterleavedParquetWriterStage(
 pipeline.run()
 ```
 
+## LaTeX Ingestion (arXiv)
+
+Two independent paths convert arXiv bulk source tarballs. They differ in method,
+dependencies and output, and neither subsumes the other. Import from the
+subpackage you want -- `latex.arxiv` re-exports neither, so the choice is
+explicit at every call site.
+
+| | `arxiv.latexml` | `arxiv.regex` |
+|---|---|---|
+| Method | Runs `latexmlc`, a full LaTeX processor | Pattern-matches the source directly |
+| Requires | `latexmlc` binary (not a Python package) | Nothing beyond Curator |
+| Output | HTML5 with presentation MathML | Text segments and figure references |
+| Math | MathML, original TeX kept in `alttext` | Placeholders |
+| Macros | Expanded by the TeX engine | Common cases only |
+| Cost | ~44 core-seconds per document | Milliseconds per document |
+| Failure mode | Reports per-document conversion errors | Approximates silently |
+| Emits | Parquet rows of HTML | `InterleavedBatch` |
+
+Choose on what the downstream task needs: `latexml` when math and document
+structure must survive into the output, `regex` when volume matters more than
+fidelity or when no external binary is available.
+
+```python
+# regex -- a CompositeStage, drops straight into a pipeline
+from nemo_curator.stages.interleaved.latex.arxiv.regex import ArxivLatexReader
+
+pipeline.add_stage(ArxivLatexReader(file_paths="/data/arxiv-src/", papers_per_task=100))
+```
+
+```python
+# latexml -- convert one project, outcome reported rather than raised
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.convert import convert
+
+result = convert(project_dir, root_tex="main.tex", destination=out_html)
+if result.html is not None:
+    ...  # result.argv records the exact invocation for provenance
+```
+
+### The `latexmlc` dependency
+
+`latexmlc` is a Perl binary, so unlike every other optional dependency in
+Curator it cannot be installed with a pip extra. Obtain it from the public
+ar5iv image, which bundles LaTeXML with the ar5iv bindings:
+
+```bash
+docker pull latexml/ar5ivist:2512.17     # amd64 only; no aarch64 build exists
+```
+
+The `latexml` subpackage imports without Ray, pandas or PIL, so it can run
+inside that image against a minimal source tree rather than a full Curator
+install.
+
 ## File Layout
 
 ```
@@ -150,6 +202,22 @@ stages/interleaved/
 │       ├── base.py                 # BaseInterleavedWriter (filesystem + materialization + process)
 │       ├── tabular.py              # InterleavedParquetWriterStage
 │       └── webdataset.py           # InterleavedWebdatasetWriterStage
+├── latex/
+│   └── arxiv/                      # Two independent arXiv conversion paths
+│       ├── __init__.py             # Describes both; re-exports neither
+│       ├── latexml/                # Runs latexmlc -> HTML5 + presentation MathML
+│       │   ├── convert.py          # build_argv, convert() -> ConversionResult
+│       │   ├── extract.py          # Pick the root .tex out of a submission
+│       │   ├── quality.py          # Tier/Status assessment of converted HTML
+│       │   ├── artifacts.py        # Scan output for unresolved TeX artifacts
+│       │   ├── source_text.py      # decode_text, strip_comments (own copy)
+│       │   └── ...                 # boilerplate, pool, profiling, runs, sampling
+│       └── regex/                  # Pattern-matches source -> InterleavedBatch
+│           ├── composite.py        # ArxivLatexReader (CompositeStage)
+│           ├── reader.py           # ArxivLatexReaderStage
+│           ├── partitioning.py     # ArxivTarPartitioningStage
+│           ├── parsing.py          # parse_project, Figure, TextSegment
+│           └── detex.py            # LaTeX -> plain text
 └── utils/
     ├── constants.py                # Default file extensions
     ├── materialization.py          # Three-strategy materialization dispatch

@@ -38,10 +38,11 @@ import io
 import posixpath
 import re
 import tarfile
-from dataclasses import dataclass, field
 from pathlib import Path
 
 from loguru import logger
+
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.model import ExtractedProject
 
 #: Members treated as LaTeX source when locating the root document.
 TEX_EXTENSIONS: tuple[str, ...] = (".tex", ".ltx", ".latex")
@@ -54,33 +55,6 @@ _BEGIN_DOCUMENT_RE = re.compile(r"\\begin\s*\{document\}")
 _INPUT_RE = re.compile(r"\\(?:input|include|subfile)\b\s*(?:\{([^{}]*)\}|([^\s\\{}%]+))")
 #: Root-document filenames that win a tie, in order of preference.
 _PREFERRED_ROOT_NAMES: tuple[str, ...] = ("ms", "main", "paper", "article", "manuscript", "root")
-
-
-class UnsafeMemberError(Exception):
-    """A tar member was rejected as unsafe to extract."""
-
-
-@dataclass
-class ExtractedProject:
-    """One unpacked submission."""
-
-    directory: Path
-    root_tex: str | None = None
-    """Project-relative path of the document to convert."""
-
-    other_roots: tuple[str, ...] = ()
-    """Additional documents that also look like roots -- separate candidates."""
-
-    members: tuple[str, ...] = ()
-    total_bytes: int = 0
-    kind: str = "tar"
-    """``tar``, ``single_file``, ``pdf_only`` or ``empty``."""
-
-    warnings: list[str] = field(default_factory=list)
-
-    @property
-    def root_path(self) -> Path | None:
-        return self.directory / self.root_tex if self.root_tex else None
 
 
 def _is_safe_member(member: tarfile.TarInfo) -> bool:

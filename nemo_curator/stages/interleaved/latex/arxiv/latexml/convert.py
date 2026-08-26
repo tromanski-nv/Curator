@@ -41,8 +41,9 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-from dataclasses import dataclass, field
 from pathlib import Path
+
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.model import ConversionResult
 
 #: Output format.  ``html5`` is what the ar5iv bindings target.
 FORMAT_ARGS: tuple[str, ...] = ("--format=html5",)
@@ -105,28 +106,6 @@ _RECORD_RE = re.compile(
     r"(?:\s+at\s+(?P<file>[^;]+);\s*line\s+(?P<line>\d+)(?:\s+col\s+(?P<col>\d+))?)?$",
     re.MULTILINE,
 )
-
-
-@dataclass(frozen=True)
-class ConversionResult:
-    """Outcome of one LaTeXML invocation."""
-
-    html: str | None
-    argv: tuple[str, ...]
-    """The exact ordered argv as executed -- goes verbatim into provenance."""
-
-    returncode: int
-    duration_s: float
-    n_warning: int = 0
-    n_error: int = 0
-    n_fatal: int = 0
-    log: str = ""
-    timed_out: bool = False
-    assets: tuple[str, ...] = ()
-    """Files LaTeXML emitted alongside the HTML (rasterized figures)."""
-
-    error_kinds: tuple[str, ...] = field(default_factory=tuple)
-    """Distinct ``Error:<kind>`` tokens, for triage without re-reading logs."""
 
 
 def build_argv(source: str, destination: str) -> tuple[str, ...]:

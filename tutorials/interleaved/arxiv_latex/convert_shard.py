@@ -111,7 +111,7 @@ from nemo_curator.stages.interleaved.latex.arxiv.latexml.quality import (
     source_expects_math,
 )
 from nemo_curator.stages.interleaved.latex.arxiv.latexml.sampling import parse_shard
-from nemo_curator.stages.interleaved.latex.arxiv.regex.parsing import strip_comments
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.source_text import strip_comments
 
 #: Corpus runs take every member, so no document stands for any other.
 CORPUS_WEIGHT = 1.0

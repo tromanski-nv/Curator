@@ -28,10 +28,10 @@ failure.  Each gate is cheap enough to run on every document.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from enum import StrEnum
 
 from nemo_curator.stages.interleaved.latex.arxiv.latexml.artifacts import scan as scan_artifacts
+
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.model import Assessment, HtmlCounts, Status, Tier
 
 #: Source markers implying the document contains mathematics.
 _SOURCE_MATH_RE = re.compile(
@@ -67,106 +67,6 @@ _STRUCTURAL_ERROR_KINDS: frozenset[str] = frozenset({"misdefined", "too_many_err
 
 MIN_TEXT_CHARS = 500
 MAX_REPLACEMENT_RATIO = 0.001
-
-
-class Tier(StrEnum):
-    """Usability tier for a converted document."""
-
-    A = "A"
-    """No fatals, no errors, every content gate passed."""
-
-    B = "B"
-    """Warnings only; content gates passed."""
-
-    C = "C"
-    """Localized errors; usable text but constructs may be missing."""
-
-    REJECTED = "rejected"
-    """Fatal, timeout, empty, or a failed content gate."""
-
-
-class Status(StrEnum):
-    """What happened to this document.
-
-    ``SUSPECT_NO_MATH`` and ``SUSPECT_NO_FIGURES`` are the values the original
-    status vocabulary lacked: the converter reported success, the HTML looks
-    well-formed, and content the source demonstrably contained is simply absent.
-    """
-
-    OK = "ok"
-    WARNING = "warning"
-    ERROR = "error"
-    FATAL = "fatal"
-    TIMEOUT = "timeout"
-    NO_SOURCE = "no_source"
-    SKIPPED = "skipped"
-    EMPTY_OUTPUT = "empty_output"
-    SUSPECT_NO_MATH = "suspect_no_math"
-    SUSPECT_NO_FIGURES = "suspect_no_figures"
-    SUSPECT_TRUNCATED = "suspect_truncated"
-    SUSPECT_OVERSIZED = "suspect_oversized"
-    """Output so large it can only be a converter pathology, not a paper.
-
-    The mirror of ``SUSPECT_TRUNCATED``: that gate catches a document with too
-    little text, this one catches a runaway.  Measured over 27,003 corpus
-    documents the distribution is p50 0.23 MB, p99.9 4.94 MB, p99.99 9.96 MB --
-    and one paper in a single test shard produced **1,444 MB**, 86% of its
-    shard's entire output and ~5,700x the median, from a 72-section source.
-
-    This is a *memory* gate as much as a quality one, which is why it lives
-    beside the converter rather than in the flushing logic.  Row-count and
-    byte-accumulation bounds cannot help: they are checked after a row is
-    appended, so a single row larger than the whole threshold defeats them, and
-    the observed peak was ~7x the document once the Python string, the Arrow
-    copy and the Parquet write buffers coexisted.
-    """
-    SUSPECT_ARTIFACTS = "suspect_artifacts"
-    """Raw LaTeX leaked into the rendered text -- usually a missing binding."""
-    PDF_WRAPPER = "pdf_wrapper"
-    """LaTeX source is only an ``\\includepdf`` wrapper around a shipped PDF."""
-
-
-@dataclass(frozen=True)
-class HtmlCounts:
-    """Structural counts, used both for gating and for the stage-2 cross-check."""
-
-    n_math: int = 0
-    n_alttext: int = 0
-    n_img: int = 0
-    n_section: int = 0
-    n_replacement_chars: int = 0
-    text_chars: int = 0
-
-
-@dataclass
-class Assessment:
-    """Gate outcome for one document."""
-
-    status: Status
-    tier: Tier
-    counts: HtmlCounts
-    failed_gates: tuple[str, ...] = ()
-    notes: list[str] = field(default_factory=list)
-
-    @property
-    def usable(self) -> bool:
-        return self.tier is not Tier.REJECTED
-
-    def tier_c_reason(self, n_error: int) -> str | None:
-        """Why this document landed in C: errors, artifacts, or both.
-
-        ``status`` cannot answer this on its own -- a document with *both*
-        localized errors and residual LaTeX reports ``suspect_artifacts``, which
-        is indistinguishable from artifacts alone. The two causes have different
-        remedies (a missing binding vs. a malformed source), so they are worth
-        separating explicitly rather than re-deriving downstream.
-        """
-        if self.tier is not Tier.C:
-            return None
-        artifacts = "residual_latex" in self.failed_gates
-        if artifacts and n_error:
-            return "errors+artifacts"
-        return "artifacts" if artifacts else "errors"
 
 
 def count_html(html: str) -> HtmlCounts:
