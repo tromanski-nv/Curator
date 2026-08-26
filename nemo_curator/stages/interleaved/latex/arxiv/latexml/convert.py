@@ -38,16 +38,12 @@ for the provenance record rather than a summary of it.
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 from nemo_curator.stages.interleaved.latex.arxiv.latexml.model import ConversionResult
-
-#: Output format.  ``html5`` is what the ar5iv bindings target.
-FORMAT_ARGS: tuple[str, ...] = ("--format=html5",)
 
 #: Math flags, in the ONLY correct order.  ``--pmml`` must come first so
 #: presentation MathML is the primary processor; ``--mathtex`` then attaches the
@@ -61,34 +57,24 @@ MATH_ARGS: tuple[str, ...] = ("--pmml", "--mathtex")
 #: against.  Without these, papers accumulate undefined-macro errors and trip the
 #: 100-error fatal: astro-ph0001003 measured 16 errors without them and 0 with.
 AR5IV_BINDINGS_ROOT = "/opt/ar5iv-bindings"
-BINDING_ARGS: tuple[str, ...] = (
-    "--preload=ar5iv.sty",
-    f"--path={AR5IV_BINDINGS_ROOT}/bindings",
-    f"--path={AR5IV_BINDINGS_ROOT}/supported_originals",
-)
 
-#: ar5iv's own ENTRYPOINT passes ``--timeout=2700``.  A shorter limit does not
-#: fail loudly -- it kills convertible papers and records them as failures, so
-#: the corpus silently loses its longest documents.  That is why an *arbitrary*
-#: cut is dangerous: an early 300s guess killed 12 convertible papers and logged
-#: them as failures, which is indistinguishable from a genuine defect.
-AR5IV_TIMEOUT_S = 2700
-#: Measured cut.  Over the profiled sample the completion rate at 600s and at
+#: Measured cut.  ar5iv's own ENTRYPOINT passes ``--timeout=2700``; an
+#: *arbitrary* shorter cut is dangerous, because it does not fail loudly -- an
+#: early 300s guess killed 12 convertible papers and logged them as failures,
+#: indistinguishable from a genuine defect.  Over the profiled sample the completion rate at 600s and at
 #: 2700s is identical (97.3%): every document that finishes at all finishes well
 #: inside 600s (p99 495s), and the remainder are runaways that exhaust 2700s and
 #: fail anyway.  Capping at 600s therefore changes no document's outcome and only
-#: stops paying 2100s per doomed document.  Raise it back to ``AR5IV_TIMEOUT_S``
-#: if a future sample shows documents completing in the 600-2700s window.
+#: stops paying 2100s per doomed document.  Raise it back to 2700 if a future
+#: sample shows documents completing in the 600-2700s window.
 LATEXML_TIMEOUT_S = 600
 #: Wall-clock guard outside LaTeXML, set above its internal timeout so LaTeXML
 #: gets to report its own timeout rather than being killed mid-write.
 WALL_TIMEOUT_MARGIN_S = 120
-DEFAULT_TIMEOUT_S = LATEXML_TIMEOUT_S + WALL_TIMEOUT_MARGIN_S
 
-#: Matches ar5iv's ENTRYPOINT.  ``--noinvisibletimes`` suppresses U+2062
-#: INVISIBLE TIMES in the MathML: without it those invisible characters land in
-#: the extracted math stream and reach the training text.
-CONFORMANCE_ARGS: tuple[str, ...] = (f"--timeout={LATEXML_TIMEOUT_S}", "--noinvisibletimes")
+#: ``--noinvisibletimes`` suppresses U+2062 INVISIBLE TIMES in the MathML:
+#: without it those invisible characters land in the extracted math stream and
+#: reach the training text.  Emitted by :meth:`LatexmlConfig.argv`.
 
 #: Deliberately NOT passed: ``--includestyles`` forces LaTeXML to digest the
 #: author's raw ``.sty``/``.cls`` files, which fights the bindings above.  It was
@@ -168,7 +154,6 @@ class LatexmlConfig:
 AR5IV_CONFIG = LatexmlConfig()
 
 
-
 _SEVERITY_RE = re.compile(r"^(Warning|Error|Fatal):", re.MULTILINE)
 
 #: A LaTeXML diagnostic: ``Warning:kind:object message at file; line N col M``.
@@ -181,50 +166,12 @@ _RECORD_RE = re.compile(
 )
 
 
-def build_argv(source: str, destination: str, config: LatexmlConfig = AR5IV_CONFIG) -> tuple[str, ...]:
-    """Build the full ordered ``latexmlc`` argv.
-
-    Returned as a tuple and recorded verbatim in the dataset provenance: two
-    invocations differing only in flag *order* are not equivalent, so a
-    provenance record that summarizes or sorts the flags cannot distinguish a
-    good corpus from a math-free one.
-    """
-    return config.argv(source, destination)
-
-
 def count_severities(log: str) -> tuple[int, int, int]:
     """Return ``(warnings, errors, fatals)`` from a LaTeXML log."""
     counts = {"Warning": 0, "Error": 0, "Fatal": 0}
     for match in _SEVERITY_RE.finditer(log):
         counts[match.group(1)] += 1
     return counts["Warning"], counts["Error"], counts["Fatal"]
-
-
-def parse_records(log: str, limit: int = 400) -> list[dict[str, object]]:
-    """Extract individual diagnostics, not just counts.
-
-    A count says "12 errors"; a record says *which* construct failed and *where*,
-    which is the difference between knowing a document is degraded and being able
-    to fix the binding responsible.  Capped at *limit* records so one pathological
-    document cannot bloat an export.
-    """
-    records: list[dict[str, object]] = []
-    for match in _RECORD_RE.finditer(log):
-        if len(records) >= limit:
-            break
-        line = match.group("line")
-        records.append(
-            {
-                "severity": match.group("severity"),
-                "kind": match.group("kind"),
-                "object": (match.group("object") or "").strip(),
-                "message": " ".join((match.group("message") or "").split())[:300],
-                "file": (match.group("file") or "").strip(),
-                "line": int(line) if line else None,
-                "col": int(match.group("col")) if match.group("col") else None,
-            }
-        )
-    return records
 
 
 def error_kinds(log: str) -> tuple[str, ...]:
@@ -311,36 +258,3 @@ def convert(
     )
 
 
-def converter_identity(image_path: str | None = None, config: LatexmlConfig = AR5IV_CONFIG) -> dict[str, str]:
-    """Describe the converter precisely enough to reproduce a conversion.
-
-    A container *tag* is a mutable pointer -- the same tag can be re-pushed with
-    a different LaTeXML underneath.  When the pinned squashfs is available its
-    sha256 is recorded instead, which cannot change under a sealed dataset.
-    """
-    identity: dict[str, str] = {
-        "argv_template": " ".join(config.argv("<source>", "<destination>")),
-        "excluded_args": " ".join(EXCLUDED_ARGS),
-    }
-    for key, env in (
-        ("latexml_version", "LATEXML_VERSION"),
-        ("latexml_commit", "LATEXML_COMMIT"),
-        ("ar5iv_bindings_commit", "AR5IV_BINDINGS_COMMIT"),
-        ("max_errors", "MAX_ERRORS"),
-        ("max_warnings", "MAX_WARNINGS"),
-    ):
-        value = os.environ.get(env)
-        if value:
-            identity[key] = value
-    if image_path:
-        identity["image_path"] = image_path
-        path = Path(image_path)
-        if path.exists():
-            import hashlib
-
-            digest = hashlib.sha256()
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
-                    digest.update(chunk)
-            identity["image_sha256"] = digest.hexdigest()
-    return identity

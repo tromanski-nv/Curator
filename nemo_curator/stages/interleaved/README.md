@@ -228,13 +228,12 @@ stages/interleaved/
 │       │   ├── quality.py          # Tier/Status assessment of converted HTML
 │       │   ├── artifacts.py        # Scan output for unresolved TeX artifacts
 │       │   ├── source_text.py      # decode_text, strip_comments (own copy)
-│       │   └── ...                 # boilerplate, profiling, runs, sampling
+│       │   └── boilerplate.py      # Strip ar5iv page furniture from the HTML
 │       └── regex/                  # Pattern-matches source -> InterleavedBatch
 │           ├── composite.py        # ArxivLatexReader (CompositeStage)
 │           ├── reader.py           # ArxivLatexReaderStage
 │           ├── partitioning.py     # ArxivTarPartitioningStage
-│           ├── parsing.py          # parse_project, Figure, TextSegment
-│           └── detex.py            # LaTeX -> plain text
+│           └── parsing.py          # parse_project, Figure, TextSegment
 └── utils/
     ├── constants.py                # Default file extensions
     ├── materialization.py          # Three-strategy materialization dispatch

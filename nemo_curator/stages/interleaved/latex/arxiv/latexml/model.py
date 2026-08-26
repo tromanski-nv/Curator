@@ -36,10 +36,6 @@ from pathlib import Path
 # Extraction
 # ---------------------------------------------------------------------------
 
-class UnsafeMemberError(Exception):
-    """A tar member was rejected as unsafe to extract."""
-
-
 @dataclass
 class ExtractedProject:
     """One unpacked submission."""
