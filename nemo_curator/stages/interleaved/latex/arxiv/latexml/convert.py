@@ -236,6 +236,14 @@ def convert(
     except subprocess.TimeoutExpired as exc:
         log = f"Fatal:timeout: exceeded {timeout_s}s\n{exc.stderr or ''}"
         returncode, timed_out = -1, True
+    except OSError as exc:
+        # The converter could not be launched at all -- missing binary, lost
+        # mount, not executable.  Reported rather than raised, because this
+        # function promises an outcome for every document: letting it propagate
+        # would turn a converter that vanished mid-run into a dead task instead
+        # of a shard of recorded failures.
+        log = f"Fatal:launch_failed: {type(exc).__name__}: {exc}"
+        returncode = -1
     duration = time.monotonic() - started
 
     html = destination.read_text(encoding="utf-8", errors="replace") if destination.exists() else None
