@@ -29,7 +29,7 @@ import fsspec
 import pyarrow as pa
 from loguru import logger
 
-from nemo_curator.core.utils import split_table_by_group_max_bytes
+from nemo_curator.core.utils import split_table_by_group
 from nemo_curator.stages.interleaved.io.readers.base import BaseInterleavedReader
 from nemo_curator.stages.interleaved.latex.arxiv.regex.parsing import (
     Figure,
@@ -428,7 +428,10 @@ class ArxivLatexReaderStage(BaseInterleavedReader):
             table = pa.Table.from_pylist([], schema=self._empty_output_schema())
         table = self._apply_ids(task.data, table)
 
-        splits = split_table_by_group_max_bytes(table, "sample_id", self.max_batch_bytes)
+        # Rows for one paper are appended consecutively by _read_submissions, which
+        # is what this helper requires -- it splits between groups without
+        # reordering, so a paper is never divided across two batches.
+        splits = split_table_by_group(table, "sample_id", max_batch_bytes=self.max_batch_bytes)
         batches: list[InterleavedBatch] = []
         for index, split in enumerate(splits):
             metadata = dict(task._metadata)
