@@ -151,7 +151,7 @@ def _uncommented(payload: bytes) -> str:
     Reuses the parser's comment handling, which also protects verbatim bodies,
     rather than re-deriving it here.
     """
-    from nemo_curator.stages.interleaved.latex.parsing import decode_text, strip_comments
+    from nemo_curator.stages.interleaved.latex.arxiv.latexml.source_text import decode_text, strip_comments
 
     return strip_comments(decode_text(payload))
 

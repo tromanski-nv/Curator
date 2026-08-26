@@ -48,8 +48,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from nemo_curator.stages.interleaved.latex.latexml.extract import extract_submission  # noqa: E402
-from nemo_curator.stages.interleaved.latex.latexml.sampling import (  # noqa: E402
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.extract import extract_submission  # noqa: E402
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.sampling import (  # noqa: E402
     estimation_sample,
     load_shards,
     parse_shard,

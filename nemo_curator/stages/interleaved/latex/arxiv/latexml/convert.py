@@ -31,7 +31,7 @@ submissions: two of four papers produced 25 KB and 41 KB of clean HTML
 containing zero math and would have been recorded as successful conversions.
 
 Nothing downstream can detect that from the exit code, which is why
-:func:`nemo_curator.stages.interleaved.latex.latexml.quality.assess` gates on
+:func:`nemo_curator.stages.interleaved.latex.arxiv.latexml.quality.assess` gates on
 the math count instead, and why :func:`build_argv` returns the full ordered argv
 for the provenance record rather than a summary of it.
 """

@@ -54,7 +54,7 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from nemo_curator.stages.interleaved.latex.latexml.convert import (
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.convert import (
     EXCLUDED_ARGS,
     build_argv,
     converter_identity,

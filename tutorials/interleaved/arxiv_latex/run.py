@@ -76,7 +76,7 @@ from nemo_curator.backends.ray_data import RayDataExecutor
 from nemo_curator.core.client import RayClient
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.interleaved.io import InterleavedParquetWriterStage
-from nemo_curator.stages.interleaved.latex import ArxivLatexReader
+from nemo_curator.stages.interleaved.latex.arxiv.regex import ArxivLatexReader
 from nemo_curator.stages.interleaved.stages import BaseInterleavedFilterStage
 from nemo_curator.tasks.interleaved import InterleavedBatch
 

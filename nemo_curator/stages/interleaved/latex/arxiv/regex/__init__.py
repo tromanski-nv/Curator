@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LaTeX source ingestion.
+from nemo_curator.stages.interleaved.latex.arxiv.regex.composite import ArxivLatexReader
+from nemo_curator.stages.interleaved.latex.arxiv.regex.partitioning import ArxivTarPartitioningStage
+from nemo_curator.stages.interleaved.latex.arxiv.regex.reader import ArxivLatexReaderStage
 
-See :mod:`nemo_curator.stages.interleaved.latex.arxiv` for the two arXiv
-conversion paths and how to choose between them.
-"""
+__all__ = ["ArxivLatexReader", "ArxivLatexReaderStage", "ArxivTarPartitioningStage"]

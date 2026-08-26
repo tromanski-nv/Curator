@@ -21,11 +21,11 @@ from typing import Any, Literal
 
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
 from nemo_curator.stages.file_partitioning import FilePartitioningStage
-from nemo_curator.stages.interleaved.latex.arxiv.partitioning import (
+from nemo_curator.stages.interleaved.latex.arxiv.regex.partitioning import (
     DEFAULT_SUBMISSION_EXTENSIONS,
     ArxivTarPartitioningStage,
 )
-from nemo_curator.stages.interleaved.latex.arxiv.reader import (
+from nemo_curator.stages.interleaved.latex.arxiv.regex.reader import (
     DEFAULT_MAX_PROJECT_BYTES,
     ArxivLatexReaderStage,
 )

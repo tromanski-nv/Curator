@@ -86,11 +86,11 @@ import pyarrow.dataset as ds
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from nemo_curator.stages.interleaved.latex.latexml.artifacts import scan as scan_artifacts
-from nemo_curator.stages.interleaved.latex.latexml.boilerplate import strip_boilerplate
-from nemo_curator.stages.interleaved.latex.latexml.convert import convert, error_kinds
-from nemo_curator.stages.interleaved.latex.latexml.extract import extract_submission
-from nemo_curator.stages.interleaved.latex.latexml.pool import (
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.artifacts import scan as scan_artifacts
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.boilerplate import strip_boilerplate
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.convert import convert, error_kinds
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.extract import extract_submission
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.pool import (
     FLUSH_ROWS,
     MAX_HTML_BYTES,
     FRAME_CENSUS,
@@ -103,15 +103,15 @@ from nemo_curator.stages.interleaved.latex.latexml.pool import (
     shard_stem,
     write_atomic,
 )
-from nemo_curator.stages.interleaved.latex.latexml.quality import (
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.quality import (
     Status,
     Tier,
     assess,
     source_expects_figures,
     source_expects_math,
 )
-from nemo_curator.stages.interleaved.latex.latexml.sampling import parse_shard
-from nemo_curator.stages.interleaved.latex.parsing import strip_comments
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.sampling import parse_shard
+from nemo_curator.stages.interleaved.latex.arxiv.regex.parsing import strip_comments
 
 #: Corpus runs take every member, so no document stands for any other.
 CORPUS_WEIGHT = 1.0

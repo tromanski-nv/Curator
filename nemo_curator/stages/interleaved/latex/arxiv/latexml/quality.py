@@ -31,7 +31,7 @@ import re
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from nemo_curator.stages.interleaved.latex.latexml.artifacts import scan as scan_artifacts
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.artifacts import scan as scan_artifacts
 
 #: Source markers implying the document contains mathematics.
 _SOURCE_MATH_RE = re.compile(

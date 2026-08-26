@@ -135,7 +135,7 @@ python tutorials/interleaved/arxiv_latex/run.py \
 ```python
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.interleaved.io import InterleavedParquetWriterStage
-from nemo_curator.stages.interleaved.latex import ArxivLatexReader
+from nemo_curator.stages.interleaved.latex.arxiv.regex import ArxivLatexReader
 
 pipeline = Pipeline(name="arxiv_latex")
 pipeline.add_stage(ArxivLatexReader(file_paths="/data/arxiv-src/", papers_per_task=100))

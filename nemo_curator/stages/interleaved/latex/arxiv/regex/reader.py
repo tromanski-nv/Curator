@@ -31,7 +31,7 @@ from loguru import logger
 
 from nemo_curator.core.utils import split_table_by_group_max_bytes
 from nemo_curator.stages.interleaved.io.readers.base import BaseInterleavedReader
-from nemo_curator.stages.interleaved.latex.parsing import (
+from nemo_curator.stages.interleaved.latex.arxiv.regex.parsing import (
     Figure,
     ParsedProject,
     TextSegment,
@@ -79,7 +79,7 @@ class ArxivLatexReaderStage(BaseInterleavedReader):
     Input tasks come from :class:`ArxivTarPartitioningStage` and carry JSON
     entries describing a byte range inside an ``arXiv_src_*.tar`` shard.  For
     each submission this stage seeks to that range, decompresses the project,
-    parses the LaTeX (see :mod:`nemo_curator.stages.interleaved.latex.parsing`),
+    parses the LaTeX (see :mod:`nemo_curator.stages.interleaved.latex.arxiv.regex.parsing`),
     and emits one row per document element in reading order.
 
     Rows per submission

@@ -84,7 +84,7 @@ _SNAPSHOT = Path("/scratch/fsw/portfolios/nemotron/projects/nemotron_n4_pre/user
 sys.path.insert(0, str(_SNAPSHOT))
 sys.path.insert(1, str(Path(__file__).resolve().parents[3]))
 
-from nemo_curator.stages.interleaved.latex.latexml.pool import is_readable_part
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.pool import is_readable_part
 
 DEFAULT_POOL = Path(
     "/lustre/fsw/portfolios/nemotron/users/tromanski/data/arxiv/snapshot-2026-07-27"

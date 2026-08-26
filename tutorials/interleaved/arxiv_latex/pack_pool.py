@@ -56,15 +56,15 @@ import pyarrow as pa
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from nemo_curator.stages.interleaved.latex.latexml.artifacts import scan as scan_artifacts
-from nemo_curator.stages.interleaved.latex.latexml.boilerplate import strip_boilerplate
-from nemo_curator.stages.interleaved.latex.latexml.convert import (
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.artifacts import scan as scan_artifacts
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.boilerplate import strip_boilerplate
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.convert import (
     build_argv,
     converter_identity,
     count_severities,
     error_kinds,
 )
-from nemo_curator.stages.interleaved.latex.latexml.pool import (
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.pool import (
     FLUSH_ROWS,
     FRAME_SAMPLE,
     SCHEMA,
@@ -77,14 +77,14 @@ from nemo_curator.stages.interleaved.latex.latexml.pool import (
     shard_stem,
     write_atomic,
 )
-from nemo_curator.stages.interleaved.latex.latexml.profiling import parse_phase_tree
-from nemo_curator.stages.interleaved.latex.latexml.quality import (
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.profiling import parse_phase_tree
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.quality import (
     assess,
     source_expects_figures,
     source_expects_math,
 )
-from nemo_curator.stages.interleaved.latex.latexml.sampling import parse_shard
-from nemo_curator.stages.interleaved.latex.parsing import strip_comments
+from nemo_curator.stages.interleaved.latex.arxiv.latexml.sampling import parse_shard
+from nemo_curator.stages.interleaved.latex.arxiv.regex.parsing import strip_comments
 
 DEFAULT_SNAPSHOT = "snapshot-2026-07-27"
 
