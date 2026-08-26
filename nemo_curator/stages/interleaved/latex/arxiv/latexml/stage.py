@@ -250,7 +250,7 @@ class LatexmlConvertStage(ProcessingStage[FileGroupTask, DocumentBatch]):
     config
         What to ask ``latexmlc`` to do.  Defaults to the ar5iv configuration.
     snapshot, converter_id
-        Recorded on every row so a pool spanning several source snapshots or
+        Recorded on every row so output spanning several source snapshots or
         converter builds stays separable after the fact.
     resume_from
         Directory of Parquet already written by an earlier run.  Submissions

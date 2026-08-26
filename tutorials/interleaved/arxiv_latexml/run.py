@@ -193,7 +193,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--snapshot",
         default="",
-        help="Source snapshot name, recorded on every row so a pool spanning snapshots stays separable",
+        help="Source snapshot name, recorded on every row so output spanning snapshots stays separable",
     )
     parser.add_argument(
         "--converter-id",

@@ -220,12 +220,15 @@ stages/interleaved/
 │   └── arxiv/                      # Two independent arXiv conversion paths
 │       ├── __init__.py             # Describes both; re-exports neither
 │       ├── latexml/                # Runs latexmlc -> HTML5 + presentation MathML
-│       │   ├── convert.py          # build_argv, convert() -> ConversionResult
+│       │   ├── model.py            # The types a conversion deals in
+│       │   ├── convert.py          # LatexmlConfig, convert() -> ConversionResult
+│       │   ├── document.py         # convert_submission(): one submission in, one out
+│       │   ├── stage.py            # LatexmlConvertStage, ArxivLatexmlReader, HTML_SCHEMA
 │       │   ├── extract.py          # Pick the root .tex out of a submission
 │       │   ├── quality.py          # Tier/Status assessment of converted HTML
 │       │   ├── artifacts.py        # Scan output for unresolved TeX artifacts
 │       │   ├── source_text.py      # decode_text, strip_comments (own copy)
-│       │   └── ...                 # boilerplate, pool, profiling, runs, sampling
+│       │   └── ...                 # boilerplate, profiling, runs, sampling
 │       └── regex/                  # Pattern-matches source -> InterleavedBatch
 │           ├── composite.py        # ArxivLatexReader (CompositeStage)
 │           ├── reader.py           # ArxivLatexReaderStage

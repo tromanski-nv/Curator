@@ -74,7 +74,7 @@ Nothing in this pipeline needs a GPU: it is tar seeking, gunzip, and regex.
 ## Run It
 
 ```bash
-python tutorials/interleaved/arxiv_latex/run.py \
+python tutorials/interleaved/arxiv_regex/run.py \
     --input-dir /data/arxiv-src/ \
     --output-dir /data/arxiv-interleaved/ \
     --mode overwrite
@@ -101,7 +101,7 @@ python tutorials/interleaved/arxiv_latex/run.py \
 Smoke test on 200 papers per shard:
 
 ```bash
-python tutorials/interleaved/arxiv_latex/run.py \
+python tutorials/interleaved/arxiv_regex/run.py \
     --input-dir /data/arxiv-src/ \
     --output-dir /tmp/arxiv_smoke/ \
     --max-papers-per-tar 200 \
@@ -112,7 +112,7 @@ python tutorials/interleaved/arxiv_latex/run.py \
 Text-only pass with a length filter:
 
 ```bash
-python tutorials/interleaved/arxiv_latex/run.py \
+python tutorials/interleaved/arxiv_regex/run.py \
     --input-dir /data/arxiv-src/ \
     --output-dir /data/arxiv-text/ \
     --text-only \
@@ -123,7 +123,7 @@ python tutorials/interleaved/arxiv_latex/run.py \
 Read the bucket directly:
 
 ```bash
-python tutorials/interleaved/arxiv_latex/run.py \
+python tutorials/interleaved/arxiv_regex/run.py \
     --input-dir s3://arxiv/src/ \
     --output-dir /data/arxiv-interleaved/ \
     --storage-options-json '{"requester_pays": true}' \
@@ -240,44 +240,6 @@ This gets steadily better in later years; run the numbers on the shards you actu
 **Root-file selection can be wrong.** A project with several plausible root `.tex` files (paper + response letter + poster) may parse the wrong one. `root_tex` in the metadata row tells you which was chosen.
 
 **Missing graphics are dropped by default.** `on_missing_graphics="skip"` silently drops the ~0.2% of references that do not resolve. Pass `on_missing_graphics="annotate"` to the reader to get a row with `materialize_error` set instead — but note the default writer policy turns that into a hard error, so pair it with `--on-materialize-error warn`.
-
-## Viewer
-
-`viewer/` is a small Svelte 5 app that renders a paper's interleaved rows next to its published PDF, so you can check by eye that text, figures, and captions came out in the right order.
-
-```bash
-# 1. Export Parquet output into the static JSON the viewer reads.
-python tutorials/interleaved/arxiv_latex/viewer/export_samples.py \
-    /data/arxiv-interleaved/ --limit 25
-
-# 2. Build and serve.
-cd tutorials/interleaved/arxiv_latex/viewer
-npm install
-npm run build
-npm run serve          # http://127.0.0.1:5173
-```
-
-`export_samples.py` writes `public/data/index.json` (sample list plus export totals), one `public/data/samples/<n>.json` per paper, and the figure bytes under `public/data/figures/`. Everything under `public/data/` and `public/build/` is generated and gitignored — the repo ships the source, you generate the data.
-
-Each paper links to `https://arxiv.org/pdf/<id>`; pass `--pdf-dir /path/to/pdfs` to serve locally downloaded PDFs instead (useful offline, and it avoids hammering arxiv.org).
-
-Keyboard: `j`/`k` move between papers, `n`/`p` between figures, `/` focuses the filter box, `Escape` clears it. Arrow keys mirror the same actions.
-
-### PostScript in the Viewer
-
-This is where the ~96% PostScript rate bites hardest, since a browser cannot render `.eps`/`.ps` at all. `export_samples.py` handles it in three tiers:
-
-1. **Pillow + Ghostscript both available** — each PostScript figure is rasterized to a PNG preview alongside the original bytes, and the viewer shows the preview.
-2. **Neither available** — the figure becomes a placeholder card naming the file, MIME type, byte size, and (parsed straight out of the EPS `%%BoundingBox` header, no Ghostscript needed) its declared dimensions, with a download link for the original.
-3. Either way the **original bytes are always exported**; the preview is additive.
-
-If rasterization is unavailable, `index.json` records *why* and the viewer says so on screen, rather than showing silent grey boxes. Install Ghostscript (`apt-get install ghostscript` or `conda install ghostscript`) plus `pip install pillow` and re-export to enable previews, or pass `--no-rasterize` to skip them deliberately.
-
-### Development
-
-`npm run dev` runs the Rollup watcher and the static server together. The build is Rollup + `sirv`, **not Vite**.
-
-`node render_check.mjs` is a headless jsdom smoke test: it mounts the built bundle, picks a paper that actually has figures and captions, and asserts that text/caption/figure/placeholder/metadata counts match the exported JSON, that keyboard navigation and the filter box work, and that a missing `public/data/` produces setup instructions rather than a blank page. Run it after changing the viewer.
 
 ## Related
 

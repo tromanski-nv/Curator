@@ -13,15 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""Run MinerU-HTML over the LaTeXML Parquet pool to get Markdown.
+r"""Run MinerU-HTML over the LaTeXML Parquet output to get Markdown.
 
 Adapts ``tutorials/text/mineru-html-extraction/run_pipeline.py`` to this dataset.
 Three differences from that tutorial, each forced by something real:
 
 **A tier filter, before the extractor.**  MinerU's cost is LLM inference, and
-~29% of the pool is Tier C or rejected -- documents we would discard anyway.
+~29% of the output is Tier C or rejected -- documents we would discard anyway.
 ``ParquetReader`` projects *columns* but applies no row predicate, so pointing it
-at the pool would pay full inference on documents destined for the bin.  The
+at the whole dataset would pay full inference on documents destined for the bin.  The
 filter is a stage rather than a layout change because splitting part files by
 tier would give files of ~6 documents, far too small to be worth the inodes.
 
@@ -116,7 +116,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--output-format", default="mm_md", choices=["mm_md", "md", "json", "txt", "none"])
     ap.add_argument("--fallback", default="trafilatura", choices=["trafilatura", "bypass", "empty"])
     ap.add_argument("--blocksize", default="256MB")
-    # The pool is 407 MB across 415 part files, so the default blocksize would
+    # The dataset is 407 MB across 415 part files, so the default blocksize would
     # put the whole dataset in two partitions and two thirds of the cluster's
     # cores would idle.  Curator never splits a file across workers, so the
     # partitioning granularity is a file count, not a byte count.
@@ -138,7 +138,7 @@ def main() -> None:
         blocksize=args.blocksize if args.files_per_partition is None else None,
         files_per_partition=args.files_per_partition,
         # tier drives the filter; arxiv_id and shard keep the output joinable
-        # back to the pool.  Columns not listed here never reach the writer.
+        # back to the source rows.  Columns not listed here never reach the writer.
         fields=[args.html_field, args.url_field, "tier", "arxiv_id", "shard"],
         # Arrow-backed large string columns overflow 32-bit offsets when a
         # partition is pickled between stages; object dtype has no such limit.
