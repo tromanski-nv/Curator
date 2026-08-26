@@ -393,7 +393,8 @@ class ArxivLatexmlReader(CompositeStage[EmptyTask, DocumentBatch]):
     file_paths: str | list[str] = ""
     papers_per_task: int = 100
     max_papers_per_tar: int | None = None
-    tars_per_group: int = 1
+    files_per_partition: int = 1
+    limit: int | None = None
     config: LatexmlConfig = AR5IV_CONFIG
     snapshot: str = ""
     converter_id: str = ""
@@ -401,14 +402,16 @@ class ArxivLatexmlReader(CompositeStage[EmptyTask, DocumentBatch]):
     asset_dir: str | None = None
     scratch_dir: str | None = None
     read_kwargs: dict[str, Any] = field(default_factory=dict)
+    name: str = "arxiv_latexml_reader"
 
     def decompose(self) -> list[ProcessingStage]:
         return [
             FilePartitioningStage(
                 file_paths=self.file_paths,
-                files_per_partition=self.tars_per_group,
+                files_per_partition=self.files_per_partition,
                 file_extensions=[".tar"],
                 storage_options=resolve_storage_options(io_kwargs=self.read_kwargs) or None,
+                limit=self.limit,
             ),
             LatexmlTarPartitioningStage(
                 papers_per_task=self.papers_per_task,
