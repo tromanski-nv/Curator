@@ -41,6 +41,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 from nemo_curator.stages.interleaved.latex.arxiv.latexml.model import ConversionResult
@@ -81,7 +82,8 @@ AR5IV_TIMEOUT_S = 2700
 LATEXML_TIMEOUT_S = 600
 #: Wall-clock guard outside LaTeXML, set above its internal timeout so LaTeXML
 #: gets to report its own timeout rather than being killed mid-write.
-DEFAULT_TIMEOUT_S = LATEXML_TIMEOUT_S + 120
+WALL_TIMEOUT_MARGIN_S = 120
+DEFAULT_TIMEOUT_S = LATEXML_TIMEOUT_S + WALL_TIMEOUT_MARGIN_S
 
 #: Matches ar5iv's ENTRYPOINT.  ``--noinvisibletimes`` suppresses U+2062
 #: INVISIBLE TIMES in the MathML: without it those invisible characters land in
@@ -96,6 +98,77 @@ CONFORMANCE_ARGS: tuple[str, ...] = (f"--timeout={LATEXML_TIMEOUT_S}", "--noinvi
 EXCLUDED_ARGS: tuple[str, ...] = ("--includestyles", "--css")
 
 
+@dataclass(frozen=True)
+class LatexmlConfig:
+    """What ``latexmlc`` is asked to do, and the budget for asking it.
+
+    The defaults reproduce the ar5iv configuration the published arXiv corpus
+    was built with; override a field to diverge from it deliberately rather than
+    by editing module constants, so a run that differs says so in its own
+    provenance.
+
+    Flag *order* is fixed by :meth:`argv` and is not configurable.  Two
+    invocations differing only in order are not equivalent -- ``--pmml`` must
+    precede ``--mathtex`` or the MathML loses its ``alttext`` -- and the argv is
+    recorded verbatim, so a config that could reorder flags would make two
+    provenance records compare equal while describing different output.
+    """
+
+    executable: str = "latexmlc"
+    bindings_root: str | None = AR5IV_BINDINGS_ROOT
+    """Directory holding ``bindings/`` and ``supported_originals/``; ``None`` passes neither."""
+
+    preload: tuple[str, ...] = ("ar5iv.sty",)
+    output_format: str = "html5"
+    math_args: tuple[str, ...] = MATH_ARGS
+    latexml_timeout_s: int = LATEXML_TIMEOUT_S
+    noinvisibletimes: bool = True
+    extra_args: tuple[str, ...] = ()
+    """Appended after the fixed flags. Cannot contain :data:`EXCLUDED_ARGS`."""
+
+    def __post_init__(self) -> None:
+        rejected = sorted({a.split("=", 1)[0] for a in self.extra_args} & set(EXCLUDED_ARGS))
+        if rejected:
+            msg = (
+                f"{', '.join(rejected)} must not be passed to latexmlc: --includestyles makes "
+                "LaTeXML digest the author's own .sty/.cls files, which fights the ar5iv "
+                "bindings and produces an error storm; --css references remote stylesheets "
+                "irrelevant to text extraction."
+            )
+            raise ValueError(msg)
+
+    @property
+    def wall_timeout_s(self) -> int:
+        """Timeout for the subprocess, above LaTeXML's own so it reports first."""
+        return self.latexml_timeout_s + WALL_TIMEOUT_MARGIN_S
+
+    def argv(self, source: str, destination: str) -> tuple[str, ...]:
+        """The full ordered argv for converting *source* to *destination*."""
+        bindings: tuple[str, ...] = ()
+        if self.bindings_root is not None:
+            bindings = (
+                f"--path={self.bindings_root}/bindings",
+                f"--path={self.bindings_root}/supported_originals",
+            )
+        return (
+            self.executable,
+            *(f"--preload={name}" for name in self.preload),
+            *bindings,
+            f"--format={self.output_format}",
+            *self.math_args,
+            f"--timeout={self.latexml_timeout_s}",
+            *(("--noinvisibletimes",) if self.noinvisibletimes else ()),
+            *self.extra_args,
+            f"--source={source}",
+            f"--destination={destination}",
+        )
+
+
+#: The configuration the published corpus was converted with.
+AR5IV_CONFIG = LatexmlConfig()
+
+
+
 _SEVERITY_RE = re.compile(r"^(Warning|Error|Fatal):", re.MULTILINE)
 
 #: A LaTeXML diagnostic: ``Warning:kind:object message at file; line N col M``.
@@ -108,23 +181,15 @@ _RECORD_RE = re.compile(
 )
 
 
-def build_argv(source: str, destination: str) -> tuple[str, ...]:
+def build_argv(source: str, destination: str, config: LatexmlConfig = AR5IV_CONFIG) -> tuple[str, ...]:
     """Build the full ordered ``latexmlc`` argv.
 
-    Returned as a tuple and recorded verbatim in the dataset provenance: this
-    review established that two invocations differing only in flag *order* are
-    not equivalent, so a provenance record that summarizes or sorts the flags
-    cannot distinguish a good corpus from a math-free one.
+    Returned as a tuple and recorded verbatim in the dataset provenance: two
+    invocations differing only in flag *order* are not equivalent, so a
+    provenance record that summarizes or sorts the flags cannot distinguish a
+    good corpus from a math-free one.
     """
-    return (
-        "latexmlc",
-        *BINDING_ARGS,
-        *FORMAT_ARGS,
-        *MATH_ARGS,
-        *CONFORMANCE_ARGS,
-        f"--source={source}",
-        f"--destination={destination}",
-    )
+    return config.argv(source, destination)
 
 
 def count_severities(log: str) -> tuple[int, int, int]:
@@ -179,7 +244,8 @@ def convert(
     root_tex: str,
     destination: Path,
     *,
-    timeout_s: int = DEFAULT_TIMEOUT_S,
+    config: LatexmlConfig = AR5IV_CONFIG,
+    timeout_s: int | None = None,
 ) -> ConversionResult:
     """Convert one project to HTML.
 
@@ -190,10 +256,12 @@ def convert(
     """
     import time
 
+    if timeout_s is None:
+        timeout_s = config.wall_timeout_s
     root = Path(root_tex)
     workdir = project_dir / root.parent
     destination.parent.mkdir(parents=True, exist_ok=True)
-    argv = build_argv(root.name, str(destination))
+    argv = config.argv(root.name, str(destination))
 
     before = set(destination.parent.iterdir()) if destination.parent.exists() else set()
     started = time.monotonic()
@@ -243,7 +311,7 @@ def convert(
     )
 
 
-def converter_identity(image_path: str | None = None) -> dict[str, str]:
+def converter_identity(image_path: str | None = None, config: LatexmlConfig = AR5IV_CONFIG) -> dict[str, str]:
     """Describe the converter precisely enough to reproduce a conversion.
 
     A container *tag* is a mutable pointer -- the same tag can be re-pushed with
@@ -251,7 +319,7 @@ def converter_identity(image_path: str | None = None) -> dict[str, str]:
     sha256 is recorded instead, which cannot change under a sealed dataset.
     """
     identity: dict[str, str] = {
-        "argv_template": " ".join(build_argv("<source>", "<destination>")),
+        "argv_template": " ".join(config.argv("<source>", "<destination>")),
         "excluded_args": " ".join(EXCLUDED_ARGS),
     }
     for key, env in (
