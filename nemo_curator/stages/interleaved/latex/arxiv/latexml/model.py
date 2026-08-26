@@ -232,3 +232,70 @@ class ArtifactReport:
     @property
     def notable(self) -> bool:
         return self.structural > 0 or (self.total > 0 and self.rate >= ARTIFACT_RATE_WARN)
+
+# ---------------------------------------------------------------------------
+# A converted document
+# ---------------------------------------------------------------------------
+
+#: Refuse HTML larger than this. A runaway document must be dropped while it is
+#: still one string: measured over 27,003 documents the p99.99 is 9.96 MB, and a
+#: single 72-section paper produced 1,444 MB and drove peak RSS to 10.2 GB on its
+#: own. Row-count and byte-accumulation limits cannot catch it, because they are
+#: tested after the row has been appended.
+MAX_HTML_BYTES = 64 * 1024 * 1024
+
+
+@dataclass
+class ConvertedDocument:
+    """The outcome of putting one submission through LaTeXML.
+
+    Every submission produces one of these, including the ones that produced no
+    HTML at all -- a PDF-only submission, a tarball with no root ``.tex``, an
+    unreadable source. The denominator stays "of all submissions" rather than
+    silently becoming "of submissions that converted".
+    """
+
+    arxiv_id: str
+    source_sha256: str
+
+    kind: str | None = None
+    """``tar``, ``single_file``, ``pdf_only`` or ``empty``; the shape of the submission."""
+
+    root_tex: str | None = None
+    html: str | None = None
+
+    status: Status = Status.NO_SOURCE
+    tier: Tier = Tier.REJECTED
+    counts: HtmlCounts = field(default_factory=HtmlCounts)
+    failed_gates: tuple[str, ...] = ()
+
+    n_warning: int = 0
+    n_error: int = 0
+    n_fatal: int = 0
+    n_artifacts: int = 0
+
+    source_expects_math: bool | None = None
+    """``None`` means the source was never read -- distinct from ``False``.
+
+    A re-tiering pass must be able to tell "we never looked" from "there is no
+    math", or a read failure grades the document better than it is.
+    """
+
+    source_expects_figures: bool | None = None
+
+    duration_s: float = 0.0
+    log: str | None = None
+    n_assets: int = 0
+    """Rasterized figures LaTeXML emitted beside the HTML.
+
+    A count, not paths: the scratch tree holding them is deleted as soon as the
+    document is done, so any path handed back would already be dangling. A
+    caller that wants the bytes passes an ``asset_sink`` to
+    :func:`~...latexml.document.convert_submission` and receives them while
+    they still exist.
+    """
+
+    @property
+    def converted(self) -> bool:
+        """Whether any HTML came out. Independent of whether it is usable."""
+        return self.html is not None
