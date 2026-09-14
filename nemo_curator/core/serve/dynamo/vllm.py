@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import tempfile
 from functools import reduce
@@ -24,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 
 import ray
 from loguru import logger
+from packaging.requirements import InvalidRequirement, Requirement
 
 from nemo_curator.core.serve.base import BaseModelConfig
 from nemo_curator.core.serve.dynamo.infra import (
@@ -50,19 +52,76 @@ if TYPE_CHECKING:
     from nemo_curator.core.serve.placement import ReplicaBundleSpec
 
 
-# ai-dynamo[vllm]'s [vllm] extra carries a hard ray pin, but Ray refuses
-# actor venvs whose ray version differs from the cluster head's. uv has no
-# inline override syntax — only ``--override <file>`` — so we materialize a
-# tiny constraints file at a fixed path on every node via
-# ``ensure_actor_overrides_on_all_nodes``; the content is derived from the
-# driver's ``ray.__version__`` at fan-out time so a future Curator ray bump
-# doesn't need a code change here.
+# Ray creates the actor venv outside the project directory, so reapply the
+# driver Ray pin and CUDA-13 NIXL exclusion through an override file.
 _ACTOR_VENV_OVERRIDES_PATH = Path(tempfile.gettempdir()) / "nemo_curator_dynamo_actor_overrides.txt"
+_ACTOR_VENV_NIXL_CU13_EXCLUSION = "nixl-cu13 ; sys_platform == 'never'"
+_ACTOR_VENV_CUDA_TAG = "cu129"
+# vLLM (both 0.22.0 and 0.23.0) hard-pins nvidia-cutlass-dsl==4.5.2 but accepts
+# quack-kernels>=0.3.3 -- open-ended. quack 0.4.0 does
+# `from cutlass.base_dsl import Arch`, which 4.5.2 does not export: it defines
+# Arch in cutlass/base_dsl/arch.py without re-exporting it from __init__.py. So
+# the resolver can pick a quack that ImportErrors the moment the ViT flash-attn
+# path runs (vllm_flash_attn.cute -> quack.rmsnorm -> quack.copy_utils), taking
+# the whole EngineCore down at startup. quack 0.4.1 fixed the import to the
+# submodule path.
+#
+# This is the same remedy as upstream #2391, which added quack-kernels>=0.4.1 to
+# Curator's own `vllm` extra in pyproject.toml -- but that only fixes venvs built
+# from that pyproject. The Dynamo ACTOR venv is cloned from whatever the
+# container image shipped and then installed on top additively, so an image
+# predating #2391 still carries quack 0.4.0 and the additive install has no
+# reason to upgrade it (>=0.3.3 is already satisfied). Forcing it through the
+# --override file covers that case. Once the image is rebuilt from a post-#2391
+# lockfile this is a no-op and can be dropped.
+_ACTOR_VENV_QUACK_PIN = "quack-kernels>=0.4.1"
+
+
+def _dynamo_runtime_packages() -> list[str]:
+    """Install Dynamo's vLLM extra without upgrading the base Dynamo release."""
+    try:
+        installed_version = importlib.metadata.version("ai-dynamo")
+    except importlib.metadata.PackageNotFoundError:
+        return ["ai-dynamo[vllm]"]
+    return [f"ai-dynamo[vllm]=={installed_version}"]
+
+
+def _vllm_cu129_index_url() -> str | None:
+    """Return the CUDA 12.9 wheel index for Dynamo's pinned vLLM version."""
+    try:
+        requirements = importlib.metadata.requires("ai-dynamo") or []
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    for raw in requirements:
+        try:
+            req = Requirement(raw)
+        except InvalidRequirement:
+            continue
+        if req.name != "vllm" or (req.marker is not None and not req.marker.evaluate({"extra": "vllm"})):
+            continue
+        pinned = next((spec.version for spec in req.specifier if spec.operator in ("==", "===")), None)
+        if pinned:
+            return f"https://wheels.vllm.ai/{pinned}/{_ACTOR_VENV_CUDA_TAG}"
+    return None
+
+
+# The actor install must select CUDA 12.9 Torch and vLLM wheels even though
+# public PyPI also contains a wheel with the same base vLLM version.
+_ACTOR_VENV_UV_OPTIONS = [
+    "--override",
+    str(_ACTOR_VENV_OVERRIDES_PATH),
+    "--torch-backend",
+    _ACTOR_VENV_CUDA_TAG,
+    "--index-strategy",
+    "unsafe-best-match",
+]
+if _vllm_index_url := _vllm_cu129_index_url():
+    _ACTOR_VENV_UV_OPTIONS.extend(["--extra-index-url", _vllm_index_url])
 
 DYNAMO_VLLM_RUNTIME_ENV: dict[str, Any] = {
     "uv": {
-        "packages": ["ai-dynamo[vllm]"],
-        "uv_pip_install_options": ["--override", str(_ACTOR_VENV_OVERRIDES_PATH)],
+        "packages": _dynamo_runtime_packages(),
+        "uv_pip_install_options": _ACTOR_VENV_UV_OPTIONS,
     },
     "config": {"setup_timeout_seconds": 600},
 }
@@ -78,7 +137,10 @@ def ensure_actor_overrides_on_all_nodes(*, ignore_head_node: bool = False) -> No
 
     The file pins ``ray=={ray.__version__}`` (read from the driver) so the
     actor venv keeps the same ray patch as the cluster head — Ray rejects
-    any mismatch.
+    any mismatch — drops ``nixl-cu13`` so the cu12 NIXL backend is used, and
+    forces ``quack-kernels>=0.4.1`` so an image predating upstream #2391 can't
+    leave the broken 0.4.0 in place (see module comment on
+    :data:`_ACTOR_VENV_OVERRIDES_PATH` and :data:`_ACTOR_VENV_QUACK_PIN`).
 
     Must run inside an active Ray context, before any worker spawned with
     :data:`DYNAMO_VLLM_RUNTIME_ENV` lands. The runtime_env_agent on each
@@ -91,7 +153,7 @@ def ensure_actor_overrides_on_all_nodes(*, ignore_head_node: bool = False) -> No
     run_on_each_node(
         _write_actor_overrides_file,
         str(_ACTOR_VENV_OVERRIDES_PATH),
-        f"ray=={ray.__version__}\n",
+        f"ray=={ray.__version__}\n{_ACTOR_VENV_NIXL_CU13_EXCLUSION}\n{_ACTOR_VENV_QUACK_PIN}\n",
         ignore_head_node=ignore_head_node,
     )
 
@@ -107,16 +169,51 @@ _DISAGG_KV_EVENTS_PORT_SEED = 20081
 _DISAGG_NIXL_PORT_SEED = 20097
 
 
+def _drop_actor_venv_install(runtime_env: dict[str, Any]) -> dict[str, Any]:
+    """Suppress the actor-venv package install when ``py_executable`` is set.
+
+    ``py_executable`` names an interpreter that already exists -- typically a
+    venv prebaked into the container image at, say, ``/opt/dynamo-pdf``. Ray's
+    ``uv`` plugin does not notice: it still clones the driver venv and still
+    resolves and installs :data:`DYNAMO_VLLM_RUNTIME_ENV`'s packages (~247 of
+    them, including a multi-GB vLLM wheel pulled from wheels.vllm.ai; 2-6
+    minutes depending on uv cache warmth). ``PyExecutablePlugin`` then
+    overwrites ``context.py_executable`` with the caller's path, so the venv
+    that was just built is never used. The install is pure cost, and a hard
+    per-job dependency on wheels.vllm.ai being reachable.
+
+    So a caller asking for ``py_executable`` gets the install dropped rather
+    than performed-and-discarded. The prebaked venv owns its own contents: it
+    must already satisfy what the ``uv`` block would have installed
+    (``ai-dynamo[vllm]`` at the pinned version, plus whatever the model's own
+    ``runtime_env`` contributed).
+
+    ``ensure_actor_overrides_on_all_nodes()`` becomes a no-op in this mode --
+    the override file it writes is only read by the uv install -- but it stays
+    harmless, so callers need not branch on it.
+    """
+    if not runtime_env.get("py_executable"):
+        return runtime_env
+    trimmed = {k: v for k, v in runtime_env.items() if k not in ("uv", "pip")}
+    logger.info(
+        "runtime_env.py_executable={} -- skipping the Dynamo actor-venv package install",
+        runtime_env["py_executable"],
+    )
+    return trimmed
+
+
 def dynamo_runtime_env(model_config: DynamoVLLMModelConfig) -> dict[str, Any]:
     """Merge the user's ``runtime_env`` with the Dynamo-vLLM package pin."""
-    return BaseModelConfig.merge_runtime_envs(DYNAMO_VLLM_RUNTIME_ENV, model_config.runtime_env or None)
+    return _drop_actor_venv_install(
+        BaseModelConfig.merge_runtime_envs(DYNAMO_VLLM_RUNTIME_ENV, model_config.runtime_env or None)
+    )
 
 
 def merge_model_runtime_envs(models: list[DynamoVLLMModelConfig]) -> dict[str, Any]:
     """Merge every model's ``runtime_env`` onto the Dynamo-vLLM pin for the shared frontend actor."""
     envs = [m.runtime_env for m in models if m.runtime_env]
     user_merged = reduce(BaseModelConfig.merge_runtime_envs, envs) if envs else None
-    return BaseModelConfig.merge_runtime_envs(DYNAMO_VLLM_RUNTIME_ENV, user_merged)
+    return _drop_actor_venv_install(BaseModelConfig.merge_runtime_envs(DYNAMO_VLLM_RUNTIME_ENV, user_merged))
 
 
 def _worker_subprocess_env(base_env: dict[str, str], runtime_dir: str) -> dict[str, str]:

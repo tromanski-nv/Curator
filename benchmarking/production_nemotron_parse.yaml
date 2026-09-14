@@ -1,0 +1,199 @@
+# Production Nemotron-Parse PDF run for a large CC-style PDF corpus,
+# driven through benchmarking/run.py as a Slurm array (see
+# tutorials/slurm/submit_production_parse_array.sh). Self-contained: pass this
+# file alone to --config, do not merge with benchmarks.yaml (that file's other
+# ~10 enabled entries would run too).
+#
+# Retargeted from the H100 cluster to the GB300 cluster (oci-aga-slurm-1).
+# What changed and why:
+#   - 4 GPUs/node, not 8. A GB300 NVL72 tray is 4 GPUs + 2 Grace CPUs.
+#   - Throughput MEASURED end-to-end at 6.59 pages/s/GPU (job 715690: 145,327
+#     pages / 5,516s on 4 GPUs). Do NOT use the 9.42 figure from earlier notes:
+#     inference_stage_pages_per_sec_per_gpu is inflated when tasks < configured
+#     parallelism (benchmark:139). At full occupancy the two agree to 3.6%.
+#   - `batch` with a 3h cap, not batch_long: measured startup is 242s, so the
+#     per-shard overhead an 8h shard was meant to amortise does not exist.
+#   - Shard count re-derived; see submit_production_parse_array.sh's header.
+#
+# Sharding: each array task is one 4-GPU node processing 1/N of the corpus,
+# selected by nemo_curator.backends.slurm_array's SHA-256 shard assignment over
+# each source's deterministic id. Disjoint without coordination.
+#
+# Output layout: each shard writes one parquet file per --pdfs-per-task (25)
+# reader partition, so a shard produces hundreds of files, not one artifact --
+# one output file per task corpus-wide regardless of shard count, or ~605
+# per shard. That is well inside the inode quota, but output_path is still
+# templated per shard (shard_<4-digit-index>/) rather than one flat directory:
+# 5.33M files in a single Lustre directory is a real metadata-load risk. Still one common base (nemotron_parse_elements/) across
+# every shard and retry, per the "same result path" requirement -- nested, not
+# flat.
+#
+# TODO(tromanski): manifest/pdf_dir below do not exist yet -- the corpus
+# is not staged on this cluster, and it CANNOT be staged as written: the user
+# the byte quota is smaller than the corpus, and the inode quota is smaller
+# than the number of loose PDFs this layout implies. The source is tar-packed
+# with a byte-offset index (tar_key/member_offset/member_size) and the tars are
+# uncompressed, so a range-GET yields a PDF directly -- fetching each shard's
+# slice to node-local /raid (21 TB/node) sidesteps both limits. Resolve before
+# submitting.
+
+paths:
+  - name: "results_path"
+    host_path: "/lustre/fsw/portfolios/nemotron/users/tromanski/scratch/nemotron_parse_production/benchmark_results"
+  # SHARD_INDEX_PADDED is exported by submit_production_parse_array.sh from
+  # SHARD_INDEX (array task id + offset), zero-padded to 4 digits, which covers
+  # the 7,737-shard count (max index 7736); widening later would rename every
+  # output directory. Common parent across every shard and retry; a retry of one shard
+  # rewrites only its own subdirectory, because InterleavedParquetWriterStage
+  # names files by a deterministic hash of (source_files, task_id), so retried
+  # files overwrite the same names rather than duplicating. See
+  # nemo_curator/stages/interleaved/io/writers/base.py.
+  - name: "output_path"
+    host_path: "/lustre/fsw/portfolios/nemotron/users/tromanski/data/eai-crawl/pdfs/nemotron_parse_elements/shard_${SHARD_INDEX_PADDED}"
+  # Local (Lustre) path for Pipeline.run()'s LMDB-backed resumability state.
+  # Shared across all array tasks and retries -- each writes its own LMDB file,
+  # so there's no cross-task contention. NOTE: reusing this path with a different
+  # total_shards raises ValueError ("use a separate checkpoint path for each
+  # logical run") -- slurm_array.py. If the shard count changes, use a fresh
+  # directory; the *.mdb files can be copied in (but not .slurm_array_completion/)
+  # to retain per-PDF dedup.
+  - name: "checkpoint_path"
+    host_path: "/lustre/fsw/portfolios/nemotron/users/tromanski/scratch/nemotron_parse_production/checkpoint"
+
+datasets:
+  - name: "nemotron_parse_pdf_production"
+    formats:
+    - type: "manifest"
+      path: "/lustre/fsw/portfolios/nemotron/users/tromanski/data/eai-crawl/pdfs/raw/manifest.jsonl"
+    - type: "pdf_dir"
+      path: "/lustre/fsw/portfolios/nemotron/users/tromanski/data/eai-crawl/pdfs/raw/pdfs"
+    - type: "tar_dir"
+      path: "/lustre/fsw/portfolios/nemotron/users/tromanski/scratch/eai_crawl_chunks/PLACEHOLDER/tars"
+  - name: "nemotron_parse_pdf_model"
+    formats:
+    - type: "files"
+      path: "/lustre/fsw/portfolios/nemotron/users/tromanski/hf_cache/hub/models--nvidia--NVIDIA-Nemotron-Parse-v1.2/snapshots/2bd0189bffd6cdded6280d9f22a4077b25a504e3"
+
+# 2h45m, against the sbatch's 3h Slurm wall clock: run.py's internal timeout
+# fires 15min before Slurm would SIGKILL, so a long-running shard still exits
+# run_nemotron_parse_pdf_benchmark()'s try/finally cleanly (checkpoint LMDB
+# flushed, metrics.json written) rather than dying mid-write. Measured startup
+# is ~240s, so ~96% of the window is available for real work.
+default_timeout_s: 9900
+max_timeout_s: 9900
+
+entries:
+  # Retry-safe naming: SLURM_ARRAY_TASK_ID is this task's fixed shard index;
+  # SLURM_JOB_ID is unique per attempt and changes on requeue/resubmit, so a
+  # retry gets its own entry dir (parse_<idx>_<new-job-id>) under the same
+  # session, while --checkpoint-dir stays common so it resumes instead of
+  # reprocessing. resolve_env_vars() (benchmarking/runner/utils.py) substitutes
+  # both from the real process environment before Session.from_dict() runs, so
+  # this must be launched under an actual Slurm array.
+  - name: "parse_${SLURM_ARRAY_TASK_ID}_${SLURM_JOB_ID}"
+    enabled: true
+    script: nemotron_parse_pdf_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=ray_data
+      --manifest={dataset:nemotron_parse_pdf_production,manifest}
+      --tar-base-dir={dataset:nemotron_parse_pdf_production,tar_dir}
+      --output-dir={output_path}
+      --checkpoint-dir={checkpoint_path}
+      --model-path={dataset:nemotron_parse_pdf_model,files}
+      --model-id=nvidia/NVIDIA-Nemotron-Parse-v1.2
+      --backend=vllm
+      --inference-server-type=dynamo
+      --num-replicas=4
+      --inference-server-client-workers-per-replica=8
+      --inference-batch-size=48
+      --engine-kwargs='{"max_num_seqs":128}'
+      --inference-server-request-timeout-s=1800
+      --server-py-executable=/opt/dynamo-pdf/bin/python
+      --pdfs-per-task=25
+      --max-pages=645
+      --max-tokens=9000
+    # --enforce-eager intentionally omitted: production wants CUDA graphs enabled
+    # (args.enforce_eager defaults to False), unlike the benchmark-suite smoke
+    # entries in benchmarks.yaml which set it to skip compilation idle at startup.
+    #
+    # Concurrency: 8 clients/replica x 48 semaphore.
+    # 64 was tried on chunk_0000 and did NOT reproduce the GB200 sweep's +9.9%:
+    # the 8 real shards implied 4.63-6.52 pages/s/GPU against the 6.59 baseline
+    # measured at 48. Reverted to the value all six successful runs used.
+    #   in-flight = num_replicas * workers_per_replica * inference_batch_size
+    #             = 4 * 8 * 64 = 2,048  (512/replica)
+    # 8x48 measured 6.59 pages/s/GPU here (job 715690). The move to 64 comes from
+    # a GB200 sweep over the same 145,327-page dataset, which is consistent with
+    # our own failures in both directions:
+    #     8 clients x 64 sem -> 24.15 pages/s   <- best
+    #    12 clients x 64 sem -> 23.29
+    #     8 clients x 48 sem -> 21.97
+    #    12 clients x 48 sem -> 20.59
+    # More CLIENTS is worse at either semaphore (we saw 16 clients fail outright
+    # in tuneB); a larger SEMAPHORE is better at either client count, +9.9% at 8.
+    # Offering 2,048 in flight is only safe because max_num_seqs=128 caps the
+    # server: the surplus queues in the scheduler instead of thrashing KV, which
+    # is the same mechanism that made capping a win in the first place. It does
+    # lengthen the latency tail, which is why the 1800s request timeout below is
+    # a prerequisite rather than an optional companion.
+    # NOT yet re-measured on GB300 -- see the note in the launcher header.
+    # --inference-batch-size is NOT a batch size: inference.py:472 builds one
+    # AsyncOpenAIClient(max_concurrent_requests=N) per Ray task and gathers every
+    # page of the task through that semaphore. The H100 rationale for
+    # --pdfs-per-task=100 (a "half-empty second batch") describes a mechanism
+    # that does not exist in this code. 25 was chosen instead because 100 left
+    # 12 of 16 slots idle for one whole final task, ~13.8% of the slot budget.
+    #
+    # max_num_seqs=128 is the single biggest win found: +14% end-to-end over
+    # the otherwise-identical run, by capping Running at 128/replica (vs 279
+    # uncapped) and moving the backlog into the scheduler (Waiting 1.6 -> 180).
+    # It LOWERS per-replica generation throughput ~13% and raises end-to-end
+    # anyway, because 32 client slots each blocked on a semaphore make tail
+    # latency matter more than raw server throughput.
+    #
+    # It MUST be passed via --engine-kwargs, NOT via --max-num-seqs. On the
+    # inference-server path --max-num-seqs is silently discarded: the server is
+    # built with engine_kwargs=server_engine_kwargs only
+    # (nemotron_parse_pdf_benchmark.py:248-263), and args.max_num_seqs is used
+    # solely on the in-process branch (composite.py:141-150). It even round-trips
+    # into params.json looking honest (:372), which is how it fooled us once.
+    # Job 715690 -- the run that produced the +14% -- used
+    # --engine-kwargs='{"max_num_seqs":128}'. The single quotes are load-bearing:
+    # tuneC passed the same JSON unquoted, the shell ate the braces, and the run
+    # died at config load in 0.003s.
+    #
+    # --inference-server-request-timeout-s=1800 (default 300) is REQUIRED, not a
+    # nicety. Orchestrator chunk_9000 needed FOUR array attempts, each dying at
+    # ~20min with openai.APITimeoutError; one timed-out page aborts the whole Ray
+    # dataset (inference.py:533 raises, and Ray Data's max_errored_blocks is 0).
+    # Measured frontend latency at 512 in-flight was mean 29.1s / p99 216.4s /
+    # p99.9 284.9s -- already brushing a 300s ceiling -- and we now run 1,536 in
+    # flight, which scales the tail further. Unlike --max-num-seqs this flag IS
+    # plumbed: benchmark.py:262 -> server.py:130 (DYN_TCP_REQUEST_TIMEOUT) and
+    # inference.py:478 (client timeout).
+    #
+    # --server-py-executable points Ray at the venv prebaked into the image
+    # instead of rebuilding it per job. Measured 239.9s -> 107.4s startup
+    # (job 718150), ~285 node-hours across 7,737 shards, throughput unchanged.
+    # Requires CONTAINER_IMAGE to be the prebaked image (the launcher default).
+    #
+    # HEADROOM REMAINS: KV cache sits at only 7.9%, so the next gain is likely
+    # another max_num_seqs value rather than more client concurrency.
+    # vLLM's "363x concurrency" ceiling assumes 9,000-token requests while actual
+    # mean output is 1,049 tokens/page, so the client is still the limiter.
+    # Raising concurrency further -- and fixing --max-num-seqs, which is silently
+    # dropped on the server path at server.py:32-38 -- should improve this again.
+    #
+    # --max-pages=645 is the p99.9 of the measured page distribution (n=9,852
+    # random PDFs): it clips 0.08% of PDFs and keeps 98.3% of all pages. The
+    # previous 50 was not a tail trim -- it clipped 5.8% of PDFs and discarded
+    # 36.7% of every page in the corpus. An output audit over 200 PDFs confirmed
+    # this was the single largest data-loss channel in the pipeline: 1,640 of
+    # 3,569 available pages dropped, far exceeding every other loss source.
+    #
+    # --max-tokens=9000 matches the model's own generation_config.json
+    # max_new_tokens. At the previous 8192, 15 of 1,929 pages hit the ceiling,
+    # and a truncated generation's trailing partial element is silently dropped
+    # by parse_nemotron_output() (which only keeps elements terminated by
+    # <class_X>), making the loss invisible in the output parquet.

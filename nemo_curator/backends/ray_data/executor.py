@@ -23,6 +23,7 @@ from nemo_curator.backends.utils import execute_setup_on_node, register_loguru_s
 from nemo_curator.tasks import EmptyTask, Task
 
 from .adapter import RayDataStageAdapter
+from .diagnostics import DiagnosticsInstallStatus, install_ray_data_diagnostics
 
 if TYPE_CHECKING:
     from nemo_curator.stages.base import ProcessingStage
@@ -44,9 +45,9 @@ class RayDataExecutor(BaseExecutor):
         Args:
             config (dict[str, Any], optional): Configuration dictionary.
             ignore_head_node (bool, optional): Whether to skip the Ray head node for
-                ``setup_on_node``. Ray Data controls ``map_batches`` task/actor placement
-                through Ray's scheduler; this flag does not cap actor-pool size or force
-                Ray Data workers away from the head node.
+                ``setup_on_node`` and per-node worker-count calculations. Ray Data controls
+                ``map_batches`` placement, so this flag does not force workers away from
+                the head node.
         """
         super().__init__(config, ignore_head_node)
 
@@ -62,6 +63,12 @@ class RayDataExecutor(BaseExecutor):
         """
         if not stages:
             return []
+
+        diagnostics_status = install_ray_data_diagnostics()
+        if diagnostics_status is DiagnosticsInstallStatus.UNSUPPORTED:
+            logger.warning(
+                f"Ray Data scheduler diagnostics are unavailable for Ray {ray.__version__}; continuing without them."
+            )
 
         register_loguru_serializer()
         # This prevents verbose logging from Ray Data about serialization of the dataclass
@@ -93,7 +100,7 @@ class RayDataExecutor(BaseExecutor):
                 logger.info(f"  CPU cores: {stage.resources.cpus}, GPU ratio: {stage.resources.gpus}")
 
                 # Create adapter for this stage
-                adapter = RayDataStageAdapter(stage)
+                adapter = RayDataStageAdapter(stage, ignore_head_node=self.ignore_head_node)
 
                 # Apply stage transformation
                 current_dataset = adapter.process_dataset(current_dataset)

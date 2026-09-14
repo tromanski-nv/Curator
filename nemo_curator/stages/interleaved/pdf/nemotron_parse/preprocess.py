@@ -29,8 +29,10 @@ from loguru import logger
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.utils import (
     extract_pdf_from_jsonl,
+    extract_pdf_from_tar,
     extract_pdf_from_zip,
     extract_pdfs_from_jsonl_batch,
+    extract_pdfs_from_tar_batch,
     image_to_bytes,
     render_pdf_pages,
 )
@@ -55,6 +57,11 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
       base64 ``content`` fields in JSONL files (e.g. GitHub PDF datasets).
       Entries must include ``jsonl_file`` and either ``byte_offset`` (preferred,
       O(1) seek) or ``line_idx`` (legacy, O(N) scan).
+    - **Tar mode** (``tar_base_dir`` is set): PDFs are read from uncompressed
+      tar archives by byte range. Entries must include ``tar_file``,
+      ``byte_offset`` and ``size``. Unlike the other modes this stores ONE inode
+      per archive rather than one per document, which is what makes a corpus of
+      many millions of files stageable at all.
 
     Produces an :class:`InterleavedBatch` with one row per page, where
     ``binary_content`` holds the PNG-encoded page image and ``text_content``
@@ -77,6 +84,7 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
     zip_base_dir: str | None = None
     pdf_dir: str | None = None
     jsonl_base_dir: str | None = None
+    tar_base_dir: str | None = None
     dpi: int = 300
     max_pages: int = 50
     name: str = "pdf_preprocess"
@@ -91,6 +99,9 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
     def _get_pdf_bytes(self, file_name: str, entry: dict | None = None) -> bytes | None:
         if self.zip_base_dir is not None:
             return extract_pdf_from_zip(file_name, self.zip_base_dir)
+        if self.tar_base_dir is not None and entry is not None:
+            tar_file = os.path.join(self.tar_base_dir, entry["tar_file"])
+            return extract_pdf_from_tar(tar_file, entry["byte_offset"], entry["size"])
         if self.jsonl_base_dir is not None and entry is not None:
             jsonl_file = os.path.join(self.jsonl_base_dir, entry["jsonl_file"])
             return extract_pdf_from_jsonl(
@@ -105,8 +116,36 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
                     return f.read()
             except OSError:
                 return None
-        msg = "One of zip_base_dir, pdf_dir, or jsonl_base_dir must be set"
+        msg = "One of zip_base_dir, pdf_dir, tar_base_dir, or jsonl_base_dir must be set"
         raise ValueError(msg)
+
+    def _batch_fetch_tar(self, entries: list[dict]) -> dict[int, bytes | None]:
+        """Fetch PDF bytes for all tar-mode entries with one open per archive.
+
+        Groups by tar_file so each archive is opened exactly once and read
+        forward. A chunk is a handful of tars covering ~130k documents, so
+        without this grouping the stage would reopen the same 4 GiB file once
+        per document.
+
+        Returns a dict mapping entry index -> pdf_bytes.
+        """
+        by_file: dict[str, list[tuple[int, int, int]]] = {}  # tar -> [(idx, offset, size)]
+        results: dict[int, bytes | None] = {}
+
+        for idx, entry in enumerate(entries):
+            tar_file = entry.get("tar_file")
+            if tar_file is None or "byte_offset" not in entry or "size" not in entry:
+                results[idx] = None
+                continue
+            path = os.path.join(self.tar_base_dir, tar_file)
+            by_file.setdefault(path, []).append((idx, entry["byte_offset"], entry["size"]))
+
+        for path, triples in by_file.items():
+            fetched = extract_pdfs_from_tar_batch(path, [(o, s) for _i, o, s in triples])
+            for idx, offset, _size in triples:
+                results[idx] = fetched.get(offset)
+
+        return results
 
     def _batch_fetch_jsonl(self, entries: list[dict]) -> dict[str, bytes | None]:
         """Fetch PDF bytes for all JSONL-mode entries using one file open per JSONL.
@@ -195,9 +234,12 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
 
         parsed: list[dict] = [json.loads(e) for e in task.data]
 
-        # Pre-fetch all JSONL PDFs in batch (one file open per source JSONL)
+        # Pre-fetch in batch so each container file is opened exactly once,
+        # rather than reopened per document.
         jsonl_bytes: dict[int, bytes | None] | None = None
-        if self.jsonl_base_dir is not None:
+        if self.tar_base_dir is not None:
+            jsonl_bytes = self._batch_fetch_tar(parsed)
+        elif self.jsonl_base_dir is not None:
             jsonl_bytes = self._batch_fetch_jsonl(parsed)
 
         for idx, entry in enumerate(parsed):
@@ -215,6 +257,7 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
 
             page_images = self._render_with_timeout(pdf_bytes, file_name)
             if not page_images:
+                logger.warning(f"No pages rendered from {file_name}; skipping")
                 continue
 
             logger.debug(f"Rendered {file_name}: {len(page_images)} pages")

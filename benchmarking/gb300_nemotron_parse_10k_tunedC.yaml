@@ -1,0 +1,182 @@
+# 10k Nemotron-Parse tuning config for GB300 -- variant C: cap the DECODE BATCH.
+#
+#   CONFIG=benchmarking/gb300_nemotron_parse_10k_tunedC.yaml TOTAL_SHARDS=1 \
+#     sbatch -p batch_long --time=05:00:00 --array=0 \
+#     tutorials/slurm/submit_production_parse_array.sh
+#
+# ── C differs from the tuned baseline (run A, job 714335) in ONE knob ────────
+#   + --engine-kwargs={"max_num_seqs":128}
+#
+# WHY. Run A's end-to-end rate is set entirely by aggregate token generation:
+# 145,327 pages needed ~154.6M output tokens (~1,064 tok/page) and the four
+# replicas delivered ~6,150 tok/s each => ~24,600 tok/s => 23.13 pages/s. So the
+# only way to go faster is more tokens/s per replica.
+#
+# Bucketing every vLLM stat line from run A by the replica's own `Running`
+# count shows tokens/s is NOT monotone in concurrency -- it peaks near 100-200
+# and then DECLINES. The pattern repeats independently on all four replicas,
+# so it is not a cross-replica artefact:
+#
+#   Running:      25-50   50-100  100-200  200-300  300-450  450-700
+#   DP0 tok/s      5947     6681     6695     6535       --       --
+#   DP1 tok/s      5946     6728     6790     6592       --       --
+#   DP3 tok/s      6026     6648     6773     6517       --       --
+#   DP2 tok/s        --       --       --     6329     6310     6161
+#
+# DP2 (which the Dynamo router kept at ~416 concurrent all run) was the slowest
+# replica at every sample despite doing the same total work, 6,161 vs a 6,790
+# peak -- about 9% of throughput given away to over-subscription.
+#
+# Run A offers 4*8*48 = 1,536 in flight (384/replica), far past that peak, and
+# `Waiting` was 0 in 99.7% of samples -- the scheduler was admitting everything
+# the client sent and running an oversized decode batch.
+#
+# Run B (job 714981, 16 workers/replica = 768 offered/replica) independently
+# reproduced the same inverse relationship ACROSS its own four replicas, which
+# the Dynamo router happened to load very unevenly:
+#   DP3 median 262 running -> 6198 tok/s   DP0 median 557 -> 5940 tok/s
+#   DP2 median 415 running -> 6054 tok/s   DP1 median 656 -> 5823 tok/s
+# B's time-averaged rate was 6,004 tok/s/replica against A's 6,163: pushing
+# concurrency UP, the change this file's predecessor was written to test, made
+# throughput ~2.6% WORSE. B was cancelled once that was established.
+#
+# Finer buckets from run A locate the optimum near 80-130 concurrent:
+#   50-80 -> 6585 | 80-110 -> 6931 | 110-140 -> 6768 | 140-170 -> 6612
+#   200-240 -> 6513 | 300-400 -> 6405 | 400-500 -> 6310 | 500-700 -> 6097
+#
+# Capping max_num_seqs at 128 keeps each replica's running batch at the measured
+# peak and pushes the surplus into the waiting queue, where it costs no KV cache
+# (KV peaked at only 40.8% anyway). Expect `Waiting` to become solidly non-zero
+# for the first time -- that is the intended signal, not a regression. If the
+# 128-cap band holds its 6,768-6,931 tok/s, end-to-end should land near
+# 25.5-26 pages/s against A's measured 23.13.
+#
+# ── THE MECHANISM: decode batches >256 lose their CUDA graphs ────────────────
+# The engine config this run dumps explains why big batches are slower here:
+#     enforce_eager=False
+#     cudagraph_mode=<CUDAGraphMode.FULL_DECODE_ONLY>
+#     max_cudagraph_capture_size=256
+# Graphs are captured for decode only, and only up to batch 256. Any scheduler
+# step whose decode batch exceeds 256 falls back to eager execution. That is
+# precisely the regime the two slow arms sat in -- run A's DP2 at ~416 and all
+# four of run B's replicas at 411-656 -- while A's other three replicas (~80)
+# and this run (128) stay inside the captured range on every step. Holding
+# max_num_seqs at 128 is therefore not a throttle, it is what keeps every decode
+# step on a graph.
+#
+# This also means 256 is the ceiling worth testing, never more: raising the cap
+# above 256 re-enters eager decode. (Alternatively one could enlarge the capture
+# list via compilation_config, which is untested here.)
+#
+# NOTE ON THE KNOB. The script's own --max-num-seqs really is inert on the
+# inference-server path (server.py's _DEFAULT_ENGINE_KWARGS has no max_num_seqs;
+# composite.py only forwards it to the in-process stage). But --engine-kwargs is
+# NOT inert: it merges into _DEFAULT_ENGINE_KWARGS at server.py:63 and is turned
+# into real vLLM CLI flags by engine_kwargs_to_cli_flags (infra.py:107-127,
+# "max_num_seqs" -> "--max-num-seqs 160") at vllm.py:433. No patch needed.
+# The JSON MUST be wrapped in single quotes. process.py:64 runs the args string
+# through shlex.split, which CONSUMES bare double quotes:
+#   shlex.split('--engine-kwargs={"max_num_seqs":128}')
+#     -> ['--engine-kwargs={max_num_seqs:128}']      # invalid JSON, run dies
+#   shlex.split("--engine-kwargs='{\"max_num_seqs\":128}'")
+#     -> ['--engine-kwargs={"max_num_seqs":128}']    # correct
+# Job 715657 failed this way in ~2min before the single quotes were added.
+#
+# ── Why these values ─────────────────────────────────────────────────────────
+# The previous run (job 709519) left all 4 GPUs at 34.8% SM and 562W/1400W with
+# the Dynamo `Waiting` queue at 0 on every replica for 100% of samples and KV
+# cache at 7.4-8.8%. vLLM reported its own ceiling as
+# "Maximum concurrency for 9,000 tokens per request: 366.22x", while the client
+# offered only 4 workers x 4 replicas x 32 = 512 in flight = 128/replica.
+# The server was never backlogged: it was starved, not saturated.
+#
+#   in-flight = num_replicas * workers_per_replica * inference_batch_size
+#   here      = 4 * 8 * 48 = 1,536  ->  384/replica, just over the 366 ceiling
+#
+# Deliberately NOT the 2048/replica that raw knob-maxing suggests: offering ~5x
+# the KV budget does not raise throughput, it just moves ~1,700 requests into
+# the waiting queue. Latency scales with concurrency until throughput does, and
+# measured p99 was already 216s against a 300s timeout. Overshoot the ceiling
+# slightly so the GPU never idles; do not flood it.
+#
+# --inference-batch-size is NOT a batch size. inference.py:472 builds one
+# AsyncOpenAIClient(max_concurrent_requests=N) per Ray task and asyncio.gathers
+# every page of the task through that semaphore. It caps concurrent in-flight
+# requests; it does not group pages into a batched call.
+#
+# --pdfs-per-task 100 -> 25. 100 was carried from H100 tuning whose stated
+# rationale (a "half-empty second batch of 14") describes a mechanism that does
+# not exist in this code. What it actually cost: 100 tasks over 16 slots = 6.25
+# waves, so the final wave left 12 of 16 slots idle for one whole ~1,571s task
+# (~13.8% of the slot budget), plus ~0.9GB per in-flight batch (59.2GiB of
+# object store observed). 25 PDFs/task -> 400 tasks over 32 slots = 12.5 waves,
+# which shrinks the tail, the memory, and the blast radius of a single failure.
+#
+# --inference-server-request-timeout-s 300 -> 1800. Measured frontend latency
+# was mean 29.1s / p99 216.4s / p99.9 284.9s against a 300s default, i.e. ~6.7%
+# of requests were already retrying, and raising concurrency pushes the tail up
+# further. inference.py:533 raises the whole task on timeout and Ray Data's
+# max_errored_blocks defaults to 0, so ONE timed-out page aborts the entire
+# dataset -- that is exactly how the previous graphs arm lost 43 minutes.
+#
+# --enforce-eager omitted (CUDA graphs ON). Measured graph capture on sm_103 was
+# ~80s, not the ~35min H100 figure the handoff assumed, so it is close to free.
+# With SM at 34.8% and the model only 3.49GiB on a 284GB card, launch-bound
+# eager decode is the leading suspect for the remaining gap.
+#
+# NOTE ON THE BASELINE: do not compare against 9.42 pages/s/GPU. That number is
+# inflated 8x by nemotron_parse_pdf_benchmark.py:139, which divides stage
+# process-time by CONFIGURED parallelism (16) rather than achieved (2 tasks in
+# that 200-PDF run). Use end-to-end throughput_pages_per_sec, or the honest
+# ~3.63 pages/s/GPU end-to-end from the 10k run, as the reference.
+
+paths:
+  - name: "results_path"
+    host_path: "/lustre/fsw/portfolios/nemotron/users/tromanski/scratch/nemotron_parse_production/benchmark_results_tuned"
+  - name: "output_path"
+    host_path: "/lustre/fsw/portfolios/nemotron/users/tromanski/scratch/nemotron_parse_production/tuned10k/out_${SLURM_JOB_ID}"
+
+datasets:
+  - name: "nemotron_parse_pdf_10k"
+    formats:
+    - type: "manifest"
+      path: "/lustre/fsw/portfolios/nemotron/users/tromanski/scratch/eai_crawl_pdfs_nemotron_parse/10ksmoke/manifest.jsonl"
+    - type: "pdf_dir"
+      path: "/lustre/fsw/portfolios/nemotron/users/tromanski/scratch/eai_crawl_pdfs_nemotron_parse/10ksmoke/pdfs"
+  - name: "nemotron_parse_pdf_model"
+    formats:
+    - type: "files"
+      path: "/lustre/fsw/portfolios/nemotron/users/tromanski/hf_cache/hub/models--nvidia--NVIDIA-Nemotron-Parse-v1.2/snapshots/2bd0189bffd6cdded6280d9f22a4077b25a504e3"
+
+# Session.max_timeout_s defaults to 14340 (3h59m, sized for a 4h CI wall) and is
+# validated against the EFFECTIVE per-entry timeout after default_timeout_s has
+# been applied (session.py:147). The 14400 previously here therefore aborted at
+# config load, before Ray or vLLM ever started -- it was never a runnable config
+# (observed: job 714320 died in 47s).
+# These runs get --time=05:00:00, so raise both to 4h50m, leaving 10min of slack
+# inside the Slurm wall for the try/finally that writes metrics.json.
+default_timeout_s: 17400
+max_timeout_s: 17400
+
+entries:
+  - name: "tuned10k_${SLURM_JOB_ID}"
+    enabled: true
+    script: nemotron_parse_pdf_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=ray_data
+      --manifest={dataset:nemotron_parse_pdf_10k,manifest}
+      --pdf-dir={dataset:nemotron_parse_pdf_10k,pdf_dir}
+      --output-dir={output_path}
+      --model-path={dataset:nemotron_parse_pdf_model,files}
+      --model-id=nvidia/NVIDIA-Nemotron-Parse-v1.2
+      --backend=vllm
+      --inference-server-type=dynamo
+      --num-replicas=4
+      --inference-server-client-workers-per-replica=8
+      --inference-server-request-timeout-s=1800
+      --inference-batch-size=48
+      --pdfs-per-task=25
+      --max-pages=645
+      --max-tokens=9000
+      --engine-kwargs='{"max_num_seqs":128}'

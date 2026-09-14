@@ -1,0 +1,121 @@
+# 10,000-PDF Nemotron-Parse A/B on the GB300 cluster (oci-aga-slurm-1), driven
+# through benchmarking/run.py:
+#
+#   CONFIG=benchmarking/gb300_nemotron_parse_10k.yaml \
+#     sbatch --array=0 tutorials/slurm/submit_production_parse_array.sh
+#
+# Two entries run back-to-back in one session on one node: identical data,
+# identical hardware, differing only in --enforce-eager. That isolates the one
+# variable that actually matters for shard sizing.
+#
+# ── Why this A/B decides production config ───────────────────────────────────
+# CUDA-graph capture costs ~35min of startup (H100 figure; UNMEASURED on sm_103)
+# and buys some steady-state throughput. Against a 3h production task:
+#     eager ON : T_work = 9900 -  720 = 9180s
+#     eager OFF: T_work = 9900 - 2808 = 7092s
+#     -> graphs only win if r_graphs/r_eager > 9180/7092 = 1.294
+# So CUDA graphs must buy >29% throughput to pay for their own capture time at
+# this task size. That is a high bar, and it means the usual "eager off in
+# production" default may well be wrong here. This run measures both sides:
+# compare inference_stage_pages_per_sec_per_gpu and inference_server_startup_s.
+#
+# ── NO --checkpoint-dir here, deliberately ───────────────────────────────────
+# A shared checkpoint would let the second entry skip everything the first
+# already completed, making the comparison meaningless. Resumability and
+# disjoint-shard behaviour are covered separately by
+# smoketest_array_resumability.yaml. Run this with --array=0 (single task):
+# sharding is not what's under test.
+#
+# ── Dataset ──────────────────────────────────────────────────────────────────
+# NOTE: as of writing, 7,444 of the 10,000 PDFs at this path are zero-byte (a
+# failed copy, not a bad selection -- the 2,556 intact files average 1.50 MB
+# against the corpus mean of 1.70 MB, and their page distribution matches an
+# independent sample). Verify the sample is whole before trusting any number
+# out of this config.
+
+paths:
+  - name: "results_path"
+    host_path: "/lustre/fsw/portfolios/nemotron/users/tromanski/scratch/nemotron_parse_production/benchmark_results_10k"
+  - name: "output_path_eager"
+    host_path: "/lustre/fsw/portfolios/nemotron/users/tromanski/scratch/nemotron_parse_production/ab10k/out_eager"
+  - name: "output_path_graphs"
+    host_path: "/lustre/fsw/portfolios/nemotron/users/tromanski/scratch/nemotron_parse_production/ab10k/out_graphs"
+
+datasets:
+  - name: "nemotron_parse_pdf_10k"
+    formats:
+    - type: "manifest"
+      path: "/lustre/fsw/portfolios/nemotron/users/tromanski/scratch/eai_crawl_pdfs_nemotron_parse/10ksmoke/manifest.jsonl"
+    - type: "pdf_dir"
+      path: "/lustre/fsw/portfolios/nemotron/users/tromanski/scratch/eai_crawl_pdfs_nemotron_parse/10ksmoke/pdfs"
+  - name: "nemotron_parse_pdf_model"
+    formats:
+    - type: "files"
+      path: "/lustre/fsw/portfolios/nemotron/users/tromanski/hf_cache/hub/models--nvidia--NVIDIA-Nemotron-Parse-v1.2/snapshots/2bd0189bffd6cdded6280d9f22a4077b25a504e3"
+
+# 4h per entry. The first attempt (job 709519) budgeted 2.5h using the
+# INFERENCE-STAGE rate of 9.42 pages/s/GPU; end-to-end is ~3.6 pages/s/GPU once
+# rasterization, postprocess and parquet writes are counted, so entry A timed
+# out at 85/100 tasks. 10k PDFs at ~14.5 effective pages/PDF is ~145k pages,
+# ~2.8h end-to-end at that rate, plus ~8min startup.
+default_timeout_s: 14400
+
+entries:
+  # A: CUDA graphs disabled. Fast startup, the configuration the 9.42
+  # pages/s/GPU reference number was measured under.
+  - name: "ab10k_eager_${SLURM_JOB_ID}"
+    enabled: true
+    script: nemotron_parse_pdf_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=ray_data
+      --manifest={dataset:nemotron_parse_pdf_10k,manifest}
+      --pdf-dir={dataset:nemotron_parse_pdf_10k,pdf_dir}
+      --output-dir={output_path_eager}
+      --model-path={dataset:nemotron_parse_pdf_model,files}
+      --model-id=nvidia/NVIDIA-Nemotron-Parse-v1.2
+      --backend=vllm
+      --inference-server-type=dynamo
+      --num-replicas=4
+      --inference-server-client-workers-per-replica=4
+      --inference-server-request-timeout-s=900
+      --inference-batch-size=32
+      --pdfs-per-task=100
+      --max-pages=645
+      --max-tokens=9000
+      --enforce-eager
+
+  # B: CUDA graphs enabled (flag simply omitted; enforce_eager defaults False).
+  - name: "ab10k_graphs_${SLURM_JOB_ID}"
+    enabled: true
+    script: nemotron_parse_pdf_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=ray_data
+      --manifest={dataset:nemotron_parse_pdf_10k,manifest}
+      --pdf-dir={dataset:nemotron_parse_pdf_10k,pdf_dir}
+      --output-dir={output_path_graphs}
+      --model-path={dataset:nemotron_parse_pdf_model,files}
+      --model-id=nvidia/NVIDIA-Nemotron-Parse-v1.2
+      --backend=vllm
+      --inference-server-type=dynamo
+      --num-replicas=4
+      --inference-server-client-workers-per-replica=4
+      --inference-server-request-timeout-s=900
+      --inference-batch-size=32
+      --pdfs-per-task=100
+      --max-pages=645
+      --max-tokens=9000
+
+# --max-pages=645 is the p99.9 of the measured page distribution (n=9,852 random
+# PDFs): it clips 0.08% of PDFs and retains 98.3% of all pages. The previous
+# value of 50 was cutting far more than a tail -- it clipped 5.8% of PDFs and
+# discarded 36.7% of every page in the corpus, which an output audit confirmed
+# was the single largest data-loss channel in the pipeline (1,640 of 3,569 pages
+# dropped across just 200 PDFs).
+#
+# --max-tokens=9000 matches the model's own generation_config.json max_new_tokens.
+# At 8192, 15 of 1,929 pages hit the ceiling, and a truncated generation's
+# trailing partial element is silently discarded by parse_nemotron_output()
+# (it only keeps elements terminated by <class_X>), so the loss is invisible in
+# the output parquet.

@@ -104,6 +104,7 @@ def test_embedding_reader_extensions_default_to_input_filetype(
     workflow._run_embedding_generation(executor=object())
 
     assert captured_stages[0].file_extensions == expected_extensions
+    assert captured_stages[1].metadata_fields == [workflow.id_field]
 
 
 @pytest.mark.gpu
@@ -204,6 +205,8 @@ class TestTextSemanticDeduplicationWorkflow:
             n_clusters=3,  # Use fewer clusters to group similar documents
             eps=0.1,  # Set epsilon to identify duplicates
             which_to_keep="hard",  # Keep harder examples (less similar to others)
+            kmeans_embedding_output_dtype="float32",
+            pairwise_compute_dtype="float32",
             use_id_generator=use_id_generator,
             id_field="id" if not use_id_generator else "_curator_dedup_id",
             input_filetype="parquet",

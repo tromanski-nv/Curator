@@ -1,0 +1,64 @@
+# Infra smoke test for production_nemotron_parse.yaml's mechanism -- NOT a
+# throughput benchmark (that's already measured, see production_nemotron_parse.yaml's
+# header) and NOT the real corpus. Validates, on the existing 500-PDF sample:
+#   1. Slurm-array shard assignment actually splits work disjointly (shards 0/1
+#      of TOTAL_SHARDS_SMOKE, submitted together, must produce non-overlapping
+#      output).
+#   2. --checkpoint-dir resumability actually skips already-completed sources
+#      (resubmitting shard 0 alone must be near-instant, not reprocess PDFs).
+# See tutorials/slurm/submit_smoketest_array_resumability.sh for how this gets
+# invoked and exact TOTAL_SHARDS_SMOKE value.
+#
+# Deliberately separate from production_nemotron_parse.yaml: own dataset (the
+# existing nemotron-parse-pr2349-smoke/ sample, not the unfetched full corpus),
+# own checkpoint/output dirs (scratch, disposable, never touches the real
+# production checkpoint state), --enforce-eager on (this test cares about the
+# mechanism working, not steady-state throughput, so skip the ~35min CUDA
+# graph compile).
+
+paths:
+  - name: "results_path"
+    host_path: "/lustre/fsw/portfolios/nemotron/users/tromanski/scratch/nemotron_parse_production_smoketest/benchmark_results"
+  - name: "output_path"
+    host_path: "/lustre/fsw/portfolios/nemotron/users/tromanski/scratch/nemotron_parse_production_smoketest/output/shard_${SHARD_INDEX_PADDED}"
+  - name: "checkpoint_path"
+    host_path: "/lustre/fsw/portfolios/nemotron/users/tromanski/scratch/nemotron_parse_production_smoketest/checkpoint"
+
+datasets:
+  - name: "nemotron_parse_pdf_smoketest"
+    formats:
+    # Repointed for the GB300 cluster: nemotron-parse-pr2349-smoke/ was the H100
+    # cluster's local sample and was never mirrored here. This is the random 10k
+    # sample fetched from the source corpus by byte-offset range-GET;
+    # --max-pdfs below keeps this a fast mechanism check rather than a full run.
+    - type: "manifest"
+      path: "/lustre/fsw/portfolios/nemotron/users/tromanski/scratch/nemotron_parse_production/smoke10k/manifest.jsonl"
+    - type: "pdf_dir"
+      path: "/lustre/fsw/portfolios/nemotron/users/tromanski/scratch/nemotron_parse_production/smoke10k/pdfs"
+  - name: "nemotron_parse_pdf_model"
+    formats:
+    - type: "files"
+      path: "/lustre/fsw/portfolios/nemotron/users/tromanski/hf_cache/hub/models--nvidia--NVIDIA-Nemotron-Parse-v1.2/snapshots/2bd0189bffd6cdded6280d9f22a4077b25a504e3"
+
+default_timeout_s: 1500
+
+entries:
+  - name: "smoketest_${SLURM_ARRAY_TASK_ID}_${SLURM_JOB_ID}"
+    enabled: true
+    script: nemotron_parse_pdf_benchmark.py
+    args: >-
+      --benchmark-results-path={session_entry_dir}
+      --executor=ray_data
+      --manifest={dataset:nemotron_parse_pdf_smoketest,manifest}
+      --pdf-dir={dataset:nemotron_parse_pdf_smoketest,pdf_dir}
+      --output-dir={output_path}
+      --checkpoint-dir={checkpoint_path}
+      --model-path={dataset:nemotron_parse_pdf_model,files}
+      --model-id=nvidia/NVIDIA-Nemotron-Parse-v1.2
+      --backend=vllm
+      --inference-server-type=dynamo
+      --inference-server-client-workers-per-replica=4
+      --inference-batch-size=32
+      --pdfs-per-task=25
+      --max-pdfs=500
+      --enforce-eager
